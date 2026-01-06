@@ -735,7 +735,7 @@ pub async fn externals_tracing_module_context(
 ) -> Result<Vc<ModuleAssetContext>> {
     let resolve_options = ResolveOptionsContext {
         enable_node_native_modules: true,
-        enable_typescript: true,
+        emulate_environment: Some(compile_time_info.await?.environment),
         loose_errors: true,
         collect_affecting_sources: true,
         custom_conditions: vec![rcstr!("node")],
