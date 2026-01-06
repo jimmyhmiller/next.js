@@ -20,172 +20,256 @@ on:
     types: [opened, synchronize]
 
 env:
-  NODE_LTS_VERSION: 22
+  NEXT_TELEMETRY_DISABLED: 1
 
 jobs:
-  changes:
-    name: Determine changes
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 25
-
-      - name: check for docs only change
-        id: docs-change
-        run: |
-          echo "DOCS_ONLY<<EOF" >> $GITHUB_OUTPUT;
-          echo "$(node scripts/run-for-change.mjs --not --type docs --exec echo 'false')" >> $GITHUB_OUTPUT;
-          echo 'EOF' >> $GITHUB_OUTPUT
-
-    outputs:
-      docs-only: ${{ steps.docs-change.outputs.DOCS_ONLY != 'false' }}
-
   build:
     name: build
-    needs: ['changes']
-    if: ${{ needs.changes.outputs.docs-only == 'false' }}
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      stepName: 'build'
-    secrets: inherit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - run: pnpm install
+      - run: pnpm build
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
 
   lint:
     name: lint
-    needs: ['build']
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: pnpm lint
-      stepName: 'lint'
-    secrets: inherit
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm lint
 
   types:
     name: types
-    needs: ['build']
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: pnpm types
-      stepName: 'types'
-    secrets: inherit
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm types
 
   test-unit:
     name: test-unit
-    needs: ['build']
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: pnpm test-unit
-      stepName: 'test-unit'
-    secrets: inherit
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm test-unit
 
   # Development tests with Turbopack (pnpm test-dev-turbo)
   test-dev-turbo:
     name: test-dev-turbo
-    needs: ['build']
+    needs: [build]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         group: [1/4, 2/4, 3/4, 4/4]
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: |
-        export IS_TURBOPACK_TEST=1
-        export TURBOPACK_DEV=1
-        export NEXT_TEST_MODE=dev
-        node run-tests.js \
-          --test-pattern '^(test\/(development|e2e))/.*\.test\.(js|jsx|ts|tsx)$' \
-          -g ${{ matrix.group }}
-      stepName: 'test-dev-turbo-${{ matrix.group }}'
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm playwright install chromium
+      - name: Run tests
+        run: |
+          node run-tests.js \
+            --test-pattern '^(test\/(development|e2e))/.*\.test\.(js|jsx|ts|tsx)$' \
+            -g ${{ matrix.group }}
+        env:
+          IS_TURBOPACK_TEST: 1
+          TURBOPACK_DEV: 1
+          NEXT_TEST_MODE: dev
 
   # Production tests with Turbopack (pnpm test-start-turbo)
   test-start-turbo:
     name: test-start-turbo
-    needs: ['build']
+    needs: [build]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         group: [1/4, 2/4, 3/4, 4/4]
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: |
-        export IS_TURBOPACK_TEST=1
-        export TURBOPACK_BUILD=1
-        export NEXT_TEST_MODE=start
-        node run-tests.js \
-          -g ${{ matrix.group }} \
-          --type production
-      stepName: 'test-start-turbo-${{ matrix.group }}'
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm playwright install chromium
+      - name: Run tests
+        run: |
+          node run-tests.js \
+            -g ${{ matrix.group }} \
+            --type production
+        env:
+          IS_TURBOPACK_TEST: 1
+          TURBOPACK_BUILD: 1
+          NEXT_TEST_MODE: start
 
   # Development tests with Webpack (pnpm test-dev)
   test-dev-webpack:
     name: test-dev-webpack
-    needs: ['build']
+    needs: [build]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         group: [1/4, 2/4, 3/4, 4/4]
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: |
-        export IS_WEBPACK_TEST=1
-        export NEXT_TEST_MODE=dev
-        node run-tests.js \
-          -g ${{ matrix.group }} \
-          --type development
-      stepName: 'test-dev-webpack-${{ matrix.group }}'
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm playwright install chromium
+      - name: Run tests
+        run: |
+          node run-tests.js \
+            -g ${{ matrix.group }} \
+            --type development
+        env:
+          IS_WEBPACK_TEST: 1
+          NEXT_TEST_MODE: dev
 
   # Production tests with Webpack (pnpm test-start)
   test-start-webpack:
     name: test-start-webpack
-    needs: ['build']
+    needs: [build]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         group: [1/4, 2/4, 3/4, 4/4]
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: |
-        export IS_WEBPACK_TEST=1
-        export NEXT_TEST_MODE=start
-        node run-tests.js \
-          -g ${{ matrix.group }} \
-          --type production
-      stepName: 'test-start-webpack-${{ matrix.group }}'
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm playwright install chromium
+      - name: Run tests
+        run: |
+          node run-tests.js \
+            -g ${{ matrix.group }} \
+            --type production
+        env:
+          IS_WEBPACK_TEST: 1
+          NEXT_TEST_MODE: start
 
   # Integration tests
   test-integration:
     name: test-integration
-    needs: ['build']
+    needs: [build]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         group: [1/4, 2/4, 3/4, 4/4]
-    uses: ./.github/workflows/build_reusable.yml
-    with:
-      afterBuild: |
-        node run-tests.js \
-          -g ${{ matrix.group }} \
-          --type integration
-      stepName: 'test-integration-${{ matrix.group }}'
-    secrets: inherit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm playwright install chromium
+      - name: Run tests
+        run: |
+          node run-tests.js \
+            -g ${{ matrix.group }} \
+            --type integration
 
   tests-pass:
     needs:
       [
-        'build',
-        'lint',
-        'types',
-        'test-unit',
-        'test-dev-turbo',
-        'test-start-turbo',
-        'test-dev-webpack',
-        'test-start-webpack',
-        'test-integration',
+        build,
+        lint,
+        types,
+        test-unit,
+        test-dev-turbo,
+        test-start-turbo,
+        test-dev-webpack,
+        test-start-webpack,
+        test-integration,
       ]
     if: always()
     runs-on: ubuntu-latest
