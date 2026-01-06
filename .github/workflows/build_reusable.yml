@@ -68,7 +68,7 @@ on:
         description: 'List of runner labels'
         required: false
         type: string
-        default: '["self-hosted", "linux", "x64", "metal"]'
+        default: '["ubuntu-latest"]'
       buildNativeTarget:
         description: 'Target for build-native step'
         required: false
