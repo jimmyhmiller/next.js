@@ -1,14 +1,8 @@
 # Update all mentions of this name in vercel-packages when changing.
+# DISABLED: This workflow is disabled for this branch
 name: build-and-deploy
 
 on:
-  push:
-    # Don't run when tags are pushed
-    branches:
-      - '**'
-  # we need the preview tarball for deploy tests
-  pull_request:
-    types: [opened, synchronize]
   workflow_dispatch:
 
 concurrency:
