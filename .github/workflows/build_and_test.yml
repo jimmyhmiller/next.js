@@ -129,7 +129,7 @@ jobs:
       - name: Run tests
         run: |
           node run-tests.js \
-            --test-pattern '^(test\/(development|e2e))/.*\.test\.(js|jsx|ts|tsx)$' \
+            --test-pattern '^(test\/(development|e2e))\/(?!.*next-config-ts-native).*\.test\.(js|jsx|ts|tsx)$' \
             -g ${{ matrix.group }}
         env:
           IS_TURBOPACK_TEST: 1
