@@ -21,6 +21,7 @@ on:
 
 env:
   NEXT_TELEMETRY_DISABLED: 1
+  NODE_VERSION: 20
 
 jobs:
   build:
@@ -30,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - run: pnpm install
       - run: pnpm build
@@ -50,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -70,7 +71,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -90,7 +91,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -115,7 +116,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -150,7 +151,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -184,7 +185,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -217,7 +218,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
@@ -250,7 +251,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - run: corepack enable pnpm
       - uses: actions/cache/restore@v4
         with:
