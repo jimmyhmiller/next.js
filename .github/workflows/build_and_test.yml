@@ -129,7 +129,7 @@ jobs:
       - name: Run tests
         run: |
           node run-tests.js \
-            --test-pattern '^(test\/(development|e2e))\/(?!.*next-config-ts-native).*\.test\.(js|jsx|ts|tsx)$' \
+            --test-pattern '^(test\/(development|e2e))/.*\.test\.(js|jsx|ts|tsx)$' \
             -g ${{ matrix.group }}
         env:
           IS_TURBOPACK_TEST: 1
@@ -266,6 +266,40 @@ jobs:
             -g ${{ matrix.group }} \
             --type integration
 
+  # Native TypeScript config tests (require Node.js experimental flags)
+  test-native-ts-config:
+    name: test-native-ts-config
+    needs: [build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [dev, start]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack enable pnpm
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            packages/*/dist
+            packages/next-swc/native
+          key: build-${{ github.sha }}
+      - run: pnpm install
+      - run: pnpm playwright install chromium
+      - name: Run tests
+        run: |
+          node run-tests.js \
+            test/e2e/app-dir/next-config-ts-native-ts/**/*.test.ts \
+            test/e2e/app-dir/next-config-ts-native-mts/**/*.test.ts
+        env:
+          __NEXT_NODE_NATIVE_TS_LOADER_ENABLED: true
+          NEXT_TEST_MODE: ${{ matrix.mode }}
+          NODE_OPTIONS: --experimental-transform-types
+
   tests-pass:
     needs:
       [
@@ -278,6 +312,7 @@ jobs:
         test-dev-webpack,
         test-start-webpack,
         test-integration,
+        test-native-ts-config,
       ]
     if: always()
     runs-on: ubuntu-latest
