@@ -20,6 +20,7 @@ pub mod environment;
 pub mod file_source;
 pub mod generated_code_source;
 pub mod ident;
+pub mod lazy_reveal;
 pub mod introspect;
 pub mod issue;
 pub mod loader;
