@@ -46,6 +46,8 @@
 use turbo_rcstr::RcStr;
 use turbo_tasks::{FxIndexSet, State, Vc};
 
+use crate::module::Module;
+
 /// Process-global registry of revealed `*.lazy.*` paths. Runtime-only (never persisted).
 #[turbo_tasks::value(serialization = "skip", eq = "manual", cell = "new")]
 pub struct LazyRevealRegistry {
@@ -94,4 +96,27 @@ pub fn is_lazy_path(path: &str) -> bool {
 #[turbo_tasks::function]
 pub fn reveal(path: RcStr) -> Vc<()> {
     LazyRevealRegistry::get().reveal(path)
+}
+
+/// Whether a module reached through a deferred (async) reference is still deferred — i.e. NOT
+/// revealed. Keyed by the module's source path. Revealed if the in-process `State` registry says so,
+/// OR (the PoC "poke") a `<file>.reveal` marker exists next to the source — a tracked VFS read, so
+/// creating/editing it re-runs the module-graph traversal and expands the subgraph.
+#[turbo_tasks::function]
+pub async fn is_module_deferred(module: Vc<Box<dyn crate::module::Module>>) -> anyhow::Result<Vc<bool>> {
+    let ident = module.ident().await?;
+    let path = &ident.path;
+    let key = path.path.clone();
+
+    let by_state = *LazyRevealRegistry::get().is_revealed(key).await?;
+
+    let marker = path
+        .parent()
+        .join(&format!("{}.reveal", path.file_name()))?;
+    let by_marker = !matches!(
+        &*marker.read().await?,
+        turbo_tasks_fs::FileContent::NotFound
+    );
+
+    Ok(Vc::cell(!(by_state || by_marker)))
 }

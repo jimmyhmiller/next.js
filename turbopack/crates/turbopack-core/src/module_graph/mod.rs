@@ -343,7 +343,8 @@ impl SingleModuleGraph {
         let root_nodes = entries
             .all_modules_with_is_traced()
             .map(|(e, is_traced)| {
-                SingleModuleGraphBuilderNode::new_module(emit_spans, e, is_traced)
+                // Entry modules are never deferred.
+                SingleModuleGraphBuilderNode::new_module(emit_spans, e, is_traced, false)
             })
             .try_join()
             .await?;
@@ -380,6 +381,7 @@ impl SingleModuleGraph {
                         module,
                         is_traced: _,
                         ident: _,
+                        deferred: _,
                     } => (module, SingleModuleGraphNode::Module(module), 1),
                     SingleModuleGraphBuilderNode::VisitedModule { module, idx } => (
                         module,
@@ -1760,6 +1762,10 @@ enum SingleModuleGraphBuilderNode {
         ident: Option<ReadRef<RcStr>>,
         /// whether this module is a tracing context
         is_traced: bool,
+        /// [DEFERRED-SUBGRAPH] This module was reached through a deferred (async `import()`)
+        /// reference that has not been revealed. The node is added to the graph, but its own
+        /// references are NOT expanded — its subgraph is deferred until forced.
+        deferred: bool,
     },
     /// A reference to a module that is already listed in visited_modules
     VisitedModule {
@@ -1773,6 +1779,7 @@ impl SingleModuleGraphBuilderNode {
         emit_spans: bool,
         module: ResolvedVc<Box<dyn Module>>,
         is_traced: bool,
+        deferred: bool,
     ) -> Result<Self> {
         Ok(Self::Module {
             module,
@@ -1783,6 +1790,7 @@ impl SingleModuleGraphBuilderNode {
                 None
             },
             is_traced,
+            deferred,
         })
     }
     fn new_visited_module(module: ResolvedVc<Box<dyn Module>>, idx: GraphNodeIndex) -> Self {
@@ -1820,7 +1828,10 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
     fn edges(&mut self, node: &SingleModuleGraphBuilderNode) -> Self::EdgesFuture {
         // Destructure beforehand to not have to clone the whole node when entering the async block
         let &SingleModuleGraphBuilderNode::Module {
-            module, is_traced, ..
+            module,
+            is_traced,
+            deferred,
+            ..
         } = node
         else {
             // These are always skipped in `visit()`
@@ -1831,6 +1842,16 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
         let include_traced = self.include_traced;
         let include_binding_usage = self.include_binding_usage;
         async move {
+            // [DEFERRED-SUBGRAPH] If this module was reached through a deferred (async `import()`)
+            // reference that has not been revealed, do NOT expand its references. The module stays a
+            // real, identity-stable node in the graph — the async loader still points at it — but
+            // its subgraph (imports, transitively) is not materialized. Revealing it invalidates
+            // this traversal, which re-runs and expands the real references, growing the graph with
+            // the subgraph, shared/deduped across every consumer (identity never changed).
+            if deferred {
+                return Ok(Vec::new());
+            }
+
             let refs_cell = if !is_traced {
                 primary_chunkable_referenced_modules(*module, include_traced, include_binding_usage)
             } else {
@@ -1872,6 +1893,17 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
                     ) || is_traced
                 })
                 .map(async |(reference, ty, binding_usage, target)| {
+                    // [DEFERRED-SUBGRAPH] An async `import()` edge whose target has NOT been revealed
+                    // makes the target a deferred node: it's added to the graph (the loader points
+                    // at it) but its own references are not expanded. Revealing it invalidates this
+                    // traversal so it re-runs and expands. Reveal is keyed by the module's source
+                    // path; the PoC "poke" is a `<file>.reveal` marker next to it (a tracked VFS
+                    // read → editing/creating it re-runs the traversal).
+                    let target_deferred = if matches!(ty, ChunkingType::Async) {
+                        *crate::lazy_reveal::is_module_deferred(*target).await?
+                    } else {
+                        false
+                    };
                     let to = if let Some(idx) = visited_modules.get(&target) {
                         SingleModuleGraphBuilderNode::new_visited_module(target, *idx)
                     } else {
@@ -1879,6 +1911,7 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
                             emit_spans,
                             target,
                             is_traced || ty.is_traced(),
+                            target_deferred,
                         )
                         .await?
                     };

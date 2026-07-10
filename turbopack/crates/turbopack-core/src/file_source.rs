@@ -74,23 +74,6 @@ impl Asset for FileSource {
                 _ => bail!("Invalid symlink"),
             },
             FileSystemEntryType::File => {
-                // [LAZY-SOURCE] Single-door gate. Every build path (parse, SSR, raw-source
-                // fallback, chunking) reads the file through this one function. If this is a
-                // `*.lazy.*` file that has NOT been revealed, hand back EMPTY content instead of the
-                // real bytes — so nothing downstream has anything to build. Revealing the path (via
-                // crate::lazy_reveal::reveal) flips a tracked State that invalidates this task,
-                // after which the real file content flows through and the module builds normally.
-                if crate::lazy_reveal::is_lazy_path(&self.path.path)
-                    && !*crate::lazy_reveal::LazyRevealRegistry::get()
-                        .is_revealed(self.path.path.clone())
-                        .await?
-                {
-                    // Empty file content: valid, parses to nothing, no work downstream.
-                    return Ok(AssetContent::File(
-                        FileContent::Content(turbo_tasks_fs::File::from("")).resolved_cell(),
-                    )
-                    .cell());
-                }
                 Ok(AssetContent::File(self.path.read().to_resolved().await?).cell())
             }
             FileSystemEntryType::NotFound => {
