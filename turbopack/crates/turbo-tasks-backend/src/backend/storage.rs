@@ -11,6 +11,7 @@ use std::{
 
 use dashmap::SharedValue;
 use hashbrown::raw::RawIntoIter;
+use rustc_hash::FxHashMap;
 use thread_local::ThreadLocal;
 use tracing::span::Id;
 use turbo_bincode::TurboBincodeBuffer;
@@ -205,6 +206,89 @@ pub struct Storage {
     pub task_cache: FxDashMap<CachedTaskTypeArc, TaskId>,
 }
 
+/// Whether boot constant tasks are enabled. Disabled by setting
+/// `TURBO_ENGINE_DISABLE_BOOT_CONSTANT=1`, which makes `boot_constant` functions behave like
+/// regular functions (for A/B measurements and as an escape hatch).
+fn boot_constant_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var("TURBO_ENGINE_DISABLE_BOOT_CONSTANT")
+            .is_ok_and(|value| !value.is_empty() && value != "0" && value != "false")
+    });
+    *ENABLED
+}
+
+/// Aggregate statistics about dependency edges across all tasks currently in memory.
+/// See [`Storage::dependency_edge_stats`].
+#[derive(Debug, Default, Clone)]
+pub struct DependencyEdgeStats {
+    pub task_count: usize,
+    pub immutable_task_count: usize,
+    /// Forward edges: what each task reads.
+    pub output_dependencies: usize,
+    pub cell_dependencies: usize,
+    pub cell_dependencies_hashed: usize,
+    pub collectibles_dependencies: usize,
+    /// Reverse edges: who reads each task.
+    pub output_dependents: usize,
+    pub cell_dependents: usize,
+    pub cell_dependents_hashed: usize,
+    pub collectibles_dependents: usize,
+    /// Functions whose tasks have the most reverse edges, descending.
+    pub top_dependents: Vec<DependentsByFunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependentsByFunction {
+    pub function: &'static str,
+    pub task_count: usize,
+    pub immutable_task_count: usize,
+    /// Total reverse edges (output + cell dependents) across all tasks of this function.
+    pub dependents: usize,
+}
+
+impl Display for DependencyEdgeStats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let forward = self.output_dependencies
+            + self.cell_dependencies
+            + self.cell_dependencies_hashed
+            + self.collectibles_dependencies;
+        let reverse = self.output_dependents
+            + self.cell_dependents
+            + self.cell_dependents_hashed
+            + self.collectibles_dependents;
+        writeln!(
+            f,
+            "tasks: {} ({} immutable)",
+            self.task_count, self.immutable_task_count
+        )?;
+        writeln!(
+            f,
+            "forward edges: {forward} (output={}, cell={}, cell_hashed={}, collectibles={})",
+            self.output_dependencies,
+            self.cell_dependencies,
+            self.cell_dependencies_hashed,
+            self.collectibles_dependencies
+        )?;
+        writeln!(
+            f,
+            "reverse edges: {reverse} (output={}, cell={}, cell_hashed={}, collectibles={})",
+            self.output_dependents,
+            self.cell_dependents,
+            self.cell_dependents_hashed,
+            self.collectibles_dependents
+        )?;
+        writeln!(f, "top functions by reverse edges:")?;
+        for entry in &self.top_dependents {
+            writeln!(
+                f,
+                "  {:>10} dependents  {:>7} tasks ({} immutable)  {}",
+                entry.dependents, entry.task_count, entry.immutable_task_count, entry.function
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl Storage {
     pub fn new(shard_amount: usize, small_preallocation: bool) -> Self {
         let map_capacity: usize = if small_preallocation {
@@ -277,6 +361,13 @@ impl Storage {
         task.flags.set_restored(TaskDataCategory::All);
         task.flags.set_new_task(true);
         if let Some(task_type) = task_type {
+            // Boot constant is a static property of the function, so it can be flagged at
+            // creation, before the first execution. This lets even the first readers skip
+            // dependency edge registration. `TURBO_ENGINE_DISABLE_BOOT_CONSTANT=1` turns the
+            // whole mechanism off (tasks behave like regular ones) for A/B measurements.
+            if task_type.native_fn.is_boot_constant && boot_constant_enabled() {
+                task.flags.set_boot_constant(true);
+            }
             task.set_persistent_task_type(task_type);
             if !task_id.is_transient() {
                 // Unconditional track: a new task's type is always a real persistable change.
@@ -534,6 +625,54 @@ impl Storage {
                 inner: b,
             },
         )
+    }
+
+    /// Collects aggregate statistics about dependency edges across all tasks currently in
+    /// memory. This is a debugging/measurement facility that iterates the whole task map;
+    /// don't call it on a hot path.
+    ///
+    /// Note that immutable tasks drop their dependency sets on completion
+    /// (`drop_on_completion_if_immutable`), so they contribute zero edges by design — the
+    /// `immutable_task_count` reflects how many tasks reached that state.
+    pub fn dependency_edge_stats(&self, top_n: usize) -> DependencyEdgeStats {
+        let mut stats = DependencyEdgeStats::default();
+        let mut by_function: FxHashMap<&'static str, DependentsByFunction> = FxHashMap::default();
+        for entry in self.map.iter() {
+            let task = entry.value();
+            stats.task_count += 1;
+            let immutable = task.flags.immutable();
+            if immutable {
+                stats.immutable_task_count += 1;
+            }
+            let summary = task.dependency_edge_summary();
+            stats.output_dependencies += summary.output_dependencies;
+            stats.cell_dependencies += summary.cell_dependencies;
+            stats.cell_dependencies_hashed += summary.cell_dependencies_hashed;
+            stats.collectibles_dependencies += summary.collectibles_dependencies;
+            stats.output_dependents += summary.output_dependents;
+            stats.cell_dependents += summary.cell_dependents;
+            stats.cell_dependents_hashed += summary.cell_dependents_hashed;
+            stats.collectibles_dependents += summary.collectibles_dependents;
+
+            let dependents = summary.dependents();
+            let function = task.function_name().unwrap_or("(transient)");
+            let per_fn = by_function
+                .entry(function)
+                .or_insert_with(|| DependentsByFunction {
+                    function,
+                    task_count: 0,
+                    immutable_task_count: 0,
+                    dependents: 0,
+                });
+            per_fn.task_count += 1;
+            per_fn.immutable_task_count += usize::from(immutable);
+            per_fn.dependents += dependents;
+        }
+        let mut top: Vec<DependentsByFunction> = by_function.into_values().collect();
+        top.sort_by(|a, b| b.dependents.cmp(&a.dependents));
+        top.truncate(top_n);
+        stats.top_dependents = top;
+        stats
     }
 
     pub fn drop_contents(&self) {

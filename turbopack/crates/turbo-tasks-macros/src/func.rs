@@ -754,6 +754,11 @@ pub struct FunctionArguments {
     /// when restored from persistent cache because they depend on external state (filesystem,
     /// environment, network) that may change between sessions.
     pub session_dependent: Option<Span>,
+    /// Should the task be marked as a boot constant? Boot constant tasks are re-executed when
+    /// restored from persistent cache (like session dependent tasks) but are guaranteed to never
+    /// change within a session: readers don't register dependency edges, and invalidating a boot
+    /// constant task at runtime is a hard error.
+    pub boot_constant: Option<Span>,
 }
 
 impl Parse for FunctionArguments {
@@ -784,11 +789,14 @@ impl Parse for FunctionArguments {
                 ("session_dependent", Meta::Path(_)) => {
                     parsed_args.session_dependent = Some(meta.span());
                 }
+                ("boot_constant", Meta::Path(_)) => {
+                    parsed_args.boot_constant = Some(meta.span());
+                }
                 (_, meta) => {
                     return Err(syn::Error::new_spanned(
                         meta,
                         "unexpected token, expected one of: \"fs\", \"network\", \"operation\", \
-                         \"root\", or \"session_dependent\"",
+                         \"root\", \"session_dependent\", or \"boot_constant\"",
                     ));
                 }
             }
@@ -1125,6 +1133,7 @@ pub struct NativeFn {
     pub filter_trait_call_args: Option<FilterTraitCallArgsTokens>,
     pub is_root: bool,
     pub is_session_dependent: bool,
+    pub is_boot_constant: bool,
 }
 
 impl NativeFn {
@@ -1138,6 +1147,7 @@ impl NativeFn {
             filter_trait_call_args,
             is_root,
             is_session_dependent,
+            is_boot_constant,
         } = self;
 
         let task_fn = if *is_method && *is_self_used {
@@ -1174,6 +1184,7 @@ impl NativeFn {
                     &#task_fn,
                     #is_root,
                     #is_session_dependent,
+                    #is_boot_constant,
                 )
             }
         }

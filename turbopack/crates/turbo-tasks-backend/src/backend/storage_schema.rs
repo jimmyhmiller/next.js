@@ -153,6 +153,13 @@ struct TaskStorageSchema {
     #[field(storage = "flag", category = "data")]
     immutable: bool,
 
+    /// Whether the task is a boot constant (persisted): constant within a session but
+    /// re-executed once per session like session dependent tasks. Readers don't register
+    /// dependency edges; invalidating the task at runtime is a hard error. Set at task
+    /// creation from `NativeFunction::is_boot_constant`.
+    #[field(storage = "flag", category = "data")]
+    boot_constant: bool,
+
     /// Whether an optimization of the aggregation number for this task is pending.
     /// Set when an `OptimizeJob` for this task is dropped without being processed (because
     /// the in-memory `optimize_queue` was at capacity, or the `AggregationUpdateQueue` ran
@@ -538,6 +545,48 @@ pub enum KeyEvictability {
     AlreadyEvicted,
     /// This means the task is new, so we cannot evict it
     Unevictable,
+}
+
+/// Per-task dependency edge counts. Debug/measurement facility used by
+/// [`super::storage::Storage::dependency_edge_stats`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TaskEdgeSummary {
+    pub output_dependencies: usize,
+    pub cell_dependencies: usize,
+    pub cell_dependencies_hashed: usize,
+    pub collectibles_dependencies: usize,
+    pub output_dependents: usize,
+    pub cell_dependents: usize,
+    pub cell_dependents_hashed: usize,
+    pub collectibles_dependents: usize,
+}
+
+impl TaskEdgeSummary {
+    pub fn dependents(&self) -> usize {
+        self.output_dependents + self.cell_dependents + self.cell_dependents_hashed
+    }
+}
+
+impl TaskStorage {
+    /// Counts the dependency edges currently stored on this task.
+    pub fn dependency_edge_summary(&self) -> TaskEdgeSummary {
+        TaskEdgeSummary {
+            output_dependencies: self.output_dependencies().map_or(0, |s| s.len()),
+            cell_dependencies: self.cell_dependencies().map_or(0, |s| s.len()),
+            cell_dependencies_hashed: self.cell_dependencies_hashed().map_or(0, |s| s.len()),
+            collectibles_dependencies: self.collectibles_dependencies().map_or(0, |s| s.len()),
+            output_dependents: self.output_dependent().len(),
+            cell_dependents: self.cell_dependents().map_or(0, |s| s.len()),
+            cell_dependents_hashed: self.cell_dependents_hashed().map_or(0, |s| s.len()),
+            collectibles_dependents: self.collectibles_dependents().map_or(0, |s| s.len()),
+        }
+    }
+
+    /// Returns the native function name for cached tasks, or `None` for transient tasks.
+    pub fn function_name(&self) -> Option<&'static str> {
+        self.get_persistent_task_type()
+            .map(|task_type| task_type.get_name())
+    }
 }
 
 impl TaskStorage {
@@ -1075,13 +1124,13 @@ mod tests {
 
         // Test persisted_bits only includes non-transient flags
         // optimization_pending=bit 0 (meta, persisted)
-        // invalidator=bit 1, immutable=bit 2 (data, persisted)
-        // current_session_clean=bit 3 (transient)
+        // invalidator=bit 1, immutable=bit 2, boot_constant=bit 3 (data, persisted)
+        // current_session_clean=bit 4 (transient)
         let persisted = storage.flags.persisted_bits();
         assert_eq!(persisted, 0b110); // invalidator + immutable
 
         // Test TaskFlags constants
-        assert_eq!(TaskFlags::PERSISTED_MASK, 0b111); // 3 persisted flags
+        assert_eq!(TaskFlags::PERSISTED_MASK, 0b1111); // 4 persisted flags
 
         // Test set_persisted_bits preserves transient flags
         let mut storage2 = TaskStorage::new();
@@ -1089,6 +1138,7 @@ mod tests {
         storage2.flags.set_persisted_bits(0b100); // Set immutable only
         assert!(storage2.flags.immutable());
         assert!(!storage2.flags.invalidator());
+        assert!(!storage2.flags.boot_constant());
         assert!(!storage2.flags.optimization_pending());
         assert!(storage2.flags.current_session_clean()); // Transient flag preserved
     }

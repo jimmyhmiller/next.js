@@ -504,11 +504,27 @@ impl DiskFileSystemInner {
 /// state (the `notify` watcher, invalidator maps, weak `TurboTasksApi`,
 /// etc.) This is important to maintain invariants in a session and ensure invalidations work, so we
 /// never evict this data.
-#[derive(Clone, ValueToString)]
-#[value_to_string(self.inner.name)]
+#[derive(Clone)]
 #[turbo_tasks::value(cell = "new", eq = "manual", evict = "never")]
 pub struct DiskFileSystem {
     inner: Arc<DiskFileSystemInner>,
+}
+
+impl ValueToStringRef for DiskFileSystem {
+    async fn to_string_ref(&self) -> Result<RcStr> {
+        Ok(self.inner.name.clone())
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl ValueToString for DiskFileSystem {
+    /// The name of a `DiskFileSystem` cannot change while the process is running, but it can
+    /// change between sessions (e.g. if the project is moved), so it is a boot constant:
+    /// readers don't register dependency edges and the value is re-validated once per session.
+    #[turbo_tasks::function(boot_constant)]
+    fn to_string(&self) -> Vc<RcStr> {
+        Vc::cell(self.inner.name.clone())
+    }
 }
 
 impl DiskFileSystem {
@@ -673,7 +689,7 @@ impl DiskFileSystem {
 
 #[turbo_tasks::value_impl]
 impl DiskFileSystem {
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     async fn new_internal(
         name: RcStr,
         root: Vc<RcStr>,

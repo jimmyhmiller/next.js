@@ -53,7 +53,10 @@ use turbo_tasks::{FunctionId, TaskDirtyCause};
 
 pub use self::{
     operation::AnyOperation,
-    storage::{EvictionCounts, SpecificTaskDataCategory, TaskDataCategory},
+    storage::{
+        DependencyEdgeStats, DependentsByFunction, EvictionCounts, SpecificTaskDataCategory,
+        TaskDataCategory,
+    },
 };
 use crate::{
     backend::{
@@ -241,6 +244,12 @@ impl TurboTasksBackend {
     /// [`crate::db_invalidation::invalidation_reasons`].
     pub fn invalidate_storage(&self, reason_code: &str) -> Result<()> {
         self.backing_storage.invalidate(reason_code)
+    }
+
+    /// Collects aggregate dependency-edge statistics by iterating all in-memory tasks.
+    /// This is a debugging/measurement facility; don't call it on a hot path.
+    pub fn dependency_edge_stats(&self, top_n: usize) -> DependencyEdgeStats {
+        self.storage.dependency_edge_stats(top_n)
     }
 
     pub fn new(mut options: BackendOptions, backing_storage: TurboBackingStorage) -> Self {
@@ -695,7 +704,8 @@ impl TurboTasksBackend {
             };
             if let Some(mut reader_task) = reader_task.take()
                 && options.tracking.should_track(result.is_err())
-                && (!task.immutable() || cfg!(feature = "verify_immutable"))
+                && (!(task.immutable() || task.boot_constant())
+                    || cfg!(feature = "verify_immutable"))
             {
                 #[cfg(feature = "trace_task_output_dependencies")]
                 let _span = tracing::trace_span!(
@@ -790,7 +800,8 @@ impl TurboTasksBackend {
             key: Option<u64>,
         ) {
             if let Some(mut reader_task) = reader_task
-                && (!task.immutable() || cfg!(feature = "verify_immutable"))
+                && (!(task.immutable() || task.boot_constant())
+                    || cfg!(feature = "verify_immutable"))
             {
                 let reader = reader.unwrap();
                 let reverse = CellRef { task: reader, cell };
@@ -1420,6 +1431,14 @@ impl TurboTasksBackend {
             self.is_idle.store(false, Ordering::Release);
             self.verify_aggregation_graph(turbo_tasks, false);
         }
+        // Debug/measurement facility: dump dependency-edge statistics before the storage is
+        // drained. Enabled via env var so any embedder (e.g. `next build`) can report them.
+        if std::env::var("TURBO_ENGINE_PRINT_EDGE_STATS").is_ok_and(|v| !v.is_empty() && v != "0") {
+            eprintln!(
+                "\nDependency edge statistics:\n{}",
+                self.storage.dependency_edge_stats(60)
+            );
+        }
         // eagerly drop the task cache before persisting
         self.storage.drop_task_cache();
         if self.should_persist() {
@@ -1594,7 +1613,9 @@ impl TurboTasksBackend {
                             },
                             &mut ctx,
                         );
-                    } else if native_fn.is_session_dependent && self.should_track_dependencies() {
+                    } else if (native_fn.is_session_dependent || native_fn.is_boot_constant)
+                        && self.should_track_dependencies()
+                    {
                         const SESSION_DEPENDENT_AGGREGATION_NUMBER: u32 = u32::MAX >> 2;
                         AggregationUpdateQueue::run(
                             AggregationUpdateJob::UpdateAggregationNumber {
@@ -2124,10 +2145,25 @@ impl TurboTasksBackend {
     ) -> Result<TaskExecutionCompletePrepareResult, TaskPriority> {
         let mut task = ctx.task(task_id, TaskDataCategory::All);
         let is_recomputation = task.is_dirty().is_none();
+        let is_boot_constant = task.boot_constant();
+        // Fail fast: an invalidator on a boot constant task means the task reads state that can
+        // change at runtime (filesystem, State, …), which would later hit the runtime
+        // invalidation panic at an arbitrary time. Report it at first execution instead.
+        if is_boot_constant && has_invalidator {
+            panic!(
+                "Task {} is marked boot_constant, but registered an invalidator during execution. \
+                 boot_constant functions must not read state that can change at runtime. Remove \
+                 the `boot_constant` marker from this function.",
+                task.get_task_description(),
+            );
+        }
         // Without dependency tracking, the SessionDependent dirty state is never read (no session
-        // restore), so skip the work
+        // restore), so skip the work.
+        // Boot constant tasks reuse the SessionDependent dirty state so they are re-executed
+        // once per session; within a session they must never change.
         let is_session_dependent = self.should_track_dependencies()
-            && matches!(task.get_task_type(), TaskTypeRef::Cached(tt) if tt.native_fn.is_session_dependent);
+            && (is_boot_constant
+                || matches!(task.get_task_type(), TaskTypeRef::Cached(tt) if tt.native_fn.is_session_dependent));
         let Some(in_progress) = task.get_in_progress_mut() else {
             panic!("Task execution completed, but task is not in progress: {task:#?}");
         };
@@ -2316,6 +2352,7 @@ impl TurboTasksBackend {
 
         // Check if output need to be updated
         let current_output = task.get_output();
+        let had_old_output = current_output.is_some();
         #[cfg(feature = "verify_determinism")]
         let no_output_set = current_output.is_none();
         let new_output = match result.map(RawVc::unpack) {
@@ -2357,6 +2394,23 @@ impl TurboTasksBackend {
                 }
             }
         };
+        // A boot constant task must always produce the same output. Its readers don't register
+        // dependency edges, so a changed output cannot be propagated to them. Reaching this
+        // point with a differing output means the value changed across a session boundary (the
+        // once-per-session re-execution produced a new result). Invalidate the persistent cache
+        // and hard error; the next start recomputes everything from scratch.
+        if is_boot_constant && new_output.is_some() && had_old_output {
+            let _ = self
+                .invalidate_storage(crate::database::db_invalidation::invalidation_reasons::PANIC);
+            panic!(
+                "Task {} is marked boot_constant, but its output changed when it was re-executed \
+                 at session start. The persistent cache has been invalidated; the next start will \
+                 recompute from scratch. If this value can legitimately change between sessions \
+                 AND at runtime, use `session_dependent` instead of `boot_constant`.",
+                task.get_task_description(),
+            );
+        }
+
         let mut output_dependent_tasks = SmallVec::<[_; 4]>::new();
         // When output has changed, grab the dependent tasks
         if new_output.is_some() && ctx.should_track_dependencies() {
@@ -2368,9 +2422,12 @@ impl TurboTasksBackend {
         // Check if the task can be marked as immutable
         let mut is_now_immutable = false;
         if let Some(dependencies) = task_dependencies_for_immutable
-            && dependencies
-                .iter()
-                .all(|&task_id| ctx.task(task_id, TaskDataCategory::Data).immutable())
+            && dependencies.iter().all(|&task_id| {
+                let dependency = ctx.task(task_id, TaskDataCategory::Data);
+                // Boot constant dependencies count as immutable: they cannot change within a
+                // session, and a cross-session change invalidates the whole persistent cache.
+                dependency.immutable() || dependency.boot_constant()
+            })
         {
             is_now_immutable = true;
         }

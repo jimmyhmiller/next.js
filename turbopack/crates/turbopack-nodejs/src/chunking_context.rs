@@ -435,7 +435,7 @@ impl ChunkingContext for NodeJsChunkingContext {
         Ok(root_path.join(&name)?.cell())
     }
 
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     fn reference_chunk_source_maps(&self, _chunk: Vc<Box<dyn OutputAsset>>) -> Vc<bool> {
         Vc::cell(match self.source_maps_type {
             SourceMapsType::Full => true,
@@ -444,7 +444,7 @@ impl ChunkingContext for NodeJsChunkingContext {
         })
     }
 
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     fn reference_module_source_maps(&self, _module: Vc<Box<dyn Module>>) -> Vc<bool> {
         Vc::cell(match self.source_maps_type {
             SourceMapsType::Full => true,

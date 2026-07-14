@@ -112,6 +112,29 @@ impl UpdateCellOperation {
             // When not recomputing, we need to notify dependent tasks if the content actually
             // changes.
 
+            // Boot constant tasks must not change their cell contents once computed. Their
+            // readers don't register dependency edges, so a change cannot be propagated. For
+            // shared cell mode, unchanged values never reach this point (the compare_and_update
+            // in the manager suppresses them), so replacing existing content here means the
+            // value changed across a session boundary: hard error. The panic invalidates the
+            // persistent cache, so the next start recomputes from scratch.
+            if task.boot_constant()
+                && let Some(old_content) = task.get_cell_data(&cell)
+                && content.as_ref() != Some(old_content)
+            {
+                panic!(
+                    "Task {} is marked boot_constant, but cell #{} (type: {}) was overwritten \
+                     when the task was re-executed at session start. Either the value changed \
+                     between sessions without the persistent cache being invalidated (this panic \
+                     invalidates it; the next start will recover), or the value type does not use \
+                     shared cell mode (`cell = \"shared\"`), which boot_constant functions \
+                     require so that unchanged values are not rewritten.",
+                    task.get_task_description(),
+                    cell.index(),
+                    value_type.ty.global_name,
+                );
+            }
+
             // For HashOnly cells without available content, use hash-based comparison to
             // detect whether the value actually changed—avoiding unnecessary invalidation.
             let skip_invalidation =

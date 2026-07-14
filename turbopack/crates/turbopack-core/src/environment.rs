@@ -95,7 +95,7 @@ impl Environment {
         })
     }
 
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     pub async fn runtime_versions(&self) -> Result<Vc<RuntimeVersions>> {
         Ok(match self.execution {
             ExecutionEnvironment::NodeJsBuildTime(node_env, ..)
@@ -282,7 +282,7 @@ impl Default for NodeJsEnvironment {
 
 #[turbo_tasks::value_impl]
 impl NodeJsEnvironment {
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     pub async fn runtime_versions(&self) -> Result<Vc<RuntimeVersions>> {
         let str = match *self.node_version.await? {
             NodeJsVersion::Current(process_env) => get_current_nodejs_version(*process_env),
@@ -343,7 +343,7 @@ pub struct EdgeWorkerEnvironment {
 
 #[turbo_tasks::value_impl]
 impl EdgeWorkerEnvironment {
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     pub async fn runtime_versions(&self) -> Result<Vc<RuntimeVersions>> {
         let str = match *self.node_version.await? {
             NodeJsVersion::Current(process_env) => get_current_nodejs_version(*process_env),
@@ -368,7 +368,7 @@ pub struct RuntimeVersions(#[turbo_tasks(trace_ignore)] pub Versions);
 #[turbo_tasks::value_impl]
 impl RuntimeVersions {
     /// Whether the environment supports arrow functions.
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     pub fn supports_arrow_functions(&self) -> Vc<bool> {
         // https://github.com/babel/babel/blob/b0e3517dc566880e76b5f1f4dcf7fcecba58337d/packages/babel-compat-data/data/plugins.json#L363-L376
         // "chrome": "47",
@@ -405,7 +405,7 @@ impl RuntimeVersions {
     }
 
     /// Whether the environment supports block scoping (let/const).
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     pub fn supports_block_scoping(&self) -> Vc<bool> {
         // https://github.com/babel/babel/blob/b0e3517dc566880e76b5f1f4dcf7fcecba58337d/packages/babel-compat-data/data/plugins.json#L538
         // "chrome": "50",

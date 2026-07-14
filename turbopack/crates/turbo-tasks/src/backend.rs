@@ -777,6 +777,7 @@ mod cached_task_type_tests {
         &into_task_fn(dummy_fn_a),
         false,
         false,
+        false,
     );
 
     static FN_B: NativeFunction = NativeFunction::new(
@@ -784,6 +785,7 @@ mod cached_task_type_tests {
         "dummy_fn_b",
         ArgMeta::new::<(i32,)>(),
         &into_task_fn(dummy_fn_b),
+        false,
         false,
         false,
     );

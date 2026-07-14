@@ -129,6 +129,27 @@ pub fn make_task_dirty_internal(
         );
     }
 
+    // Boot constant tasks promise to never change within a session. Their readers don't
+    // register dependency edges, so an invalidation cannot be propagated to them: this is a
+    // hard error in all builds. Either the function was wrongly marked `boot_constant` (it
+    // depends on state that changes at runtime), or something is invalidating it spuriously.
+    // A task without an output has never completed, so no reader can hold a stale value yet;
+    // making it dirty (e.g. `InitialDirty` for unfinished children) is harmless.
+    if task.boot_constant() && task.has_output() {
+        #[cfg(feature = "task_dirty_cause")]
+        let extra_info = format!(" Invalidation cause: {cause}");
+        #[cfg(not(feature = "task_dirty_cause"))]
+        let extra_info = "";
+
+        panic!(
+            "Task {} is marked boot_constant, but was invalidated at runtime. boot_constant \
+             functions must only depend on state that cannot change while the process is running. \
+             Remove the `boot_constant` marker from this function or stop invalidating \
+             it.{extra_info}",
+            task.get_task_description(),
+        );
+    }
+
     #[cfg(feature = "trace_task_dirty")]
     let task_name = task.get_task_name();
     if make_stale

@@ -217,6 +217,13 @@ pub struct NativeFunction {
     /// re-executed when restored from persistent cache because they depend on external state
     /// (filesystem, environment, network) that may change between sessions.
     pub is_session_dependent: bool,
+
+    /// Whether this function's tasks are boot constants: values that can change between
+    /// sessions (like session dependent tasks, they are re-executed once when restored from
+    /// persistent cache) but are guaranteed to never change within a session. Readers of boot
+    /// constant tasks don't register dependency edges; invalidating a boot constant task at
+    /// runtime is a hard error.
+    pub is_boot_constant: bool,
 }
 impl_ptr_identity!(NativeFunction);
 
@@ -245,6 +252,7 @@ impl NativeFunction {
         ty: RegistryType::new::<()>("", ""),
         is_root: false,
         is_session_dependent: false,
+        is_boot_constant: false,
     };
 
     pub const fn new<T: TaskFn>(
@@ -254,6 +262,7 @@ impl NativeFunction {
         implementation: &'static T,
         is_root: bool,
         is_session_dependent: bool,
+        is_boot_constant: bool,
     ) -> Self {
         Self {
             ty: RegistryType::new::<T>(name, global_name),
@@ -261,6 +270,7 @@ impl NativeFunction {
             implementation,
             is_root,
             is_session_dependent,
+            is_boot_constant,
         }
     }
 

@@ -222,7 +222,7 @@ impl ModuleOptions {
         ))
     }
 
-    #[turbo_tasks::function]
+    #[turbo_tasks::function(boot_constant)]
     async fn new_internal(
         path: Option<FileSystemPath>,
         module_options_context: Vc<ModuleOptionsContext>,
