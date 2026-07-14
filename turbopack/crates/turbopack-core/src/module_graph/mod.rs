@@ -1843,11 +1843,12 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
         let include_binding_usage = self.include_binding_usage;
         async move {
             // [DEFERRED-SUBGRAPH] If this module was reached through a deferred (async `import()`)
-            // reference that has not been revealed, do NOT expand its references. The module stays a
-            // real, identity-stable node in the graph — the async loader still points at it — but
-            // its subgraph (imports, transitively) is not materialized. Revealing it invalidates
-            // this traversal, which re-runs and expands the real references, growing the graph with
-            // the subgraph, shared/deduped across every consumer (identity never changed).
+            // reference that has not been revealed, do NOT expand its references. The module stays
+            // a real, identity-stable node in the graph — the async loader still points
+            // at it — but its subgraph (imports, transitively) is not materialized.
+            // Revealing it invalidates this traversal, which re-runs and expands the
+            // real references, growing the graph with the subgraph, shared/deduped
+            // across every consumer (identity never changed).
             if deferred {
                 return Ok(Vec::new());
             }
@@ -1893,9 +1894,10 @@ impl Visit<SingleModuleGraphBuilderNode, RefData> for SingleModuleGraphBuilder<'
                     ) || is_traced
                 })
                 .map(async |(reference, ty, binding_usage, target)| {
-                    // [DEFERRED-SUBGRAPH] An async `import()` edge whose target has NOT been revealed
-                    // makes the target a deferred node: it's added to the graph (the loader points
-                    // at it) but its own references are not expanded. Revealing it invalidates this
+                    // [DEFERRED-SUBGRAPH] An async `import()` edge whose target has NOT been
+                    // revealed makes the target a deferred node: it's added to
+                    // the graph (the loader points at it) but its own
+                    // references are not expanded. Revealing it invalidates this
                     // traversal so it re-runs and expands. Reveal is keyed by the module's source
                     // path; the PoC "poke" is a `<file>.reveal` marker next to it (a tracked VFS
                     // read → editing/creating it re-runs the traversal).
