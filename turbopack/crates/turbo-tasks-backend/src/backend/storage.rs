@@ -205,6 +205,52 @@ pub struct Storage {
     pub task_cache: FxDashMap<CachedTaskTypeArc, TaskId>,
 }
 
+/// One task node in a graph-shape export ([`Storage::export_graph_nodes`]). The task-level nodes
+/// are containers; `owned_cells` is where the actual values live, and `cell_deps` are the
+/// cell-precise read edges the task-level `deps` collapses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphNodeExport {
+    /// Numeric task id (edges reference these).
+    pub id: u32,
+    /// The task type's native-function name (`null` for transient/driver tasks with no type).
+    pub ty: Option<&'static str>,
+    /// Whether this is a transient (session-only) task rather than a persistent graph task.
+    pub transient: bool,
+    /// Whether the task currently has its output value resident.
+    pub has_output: bool,
+    /// Number of resident cells (data slots) — where the task's actual values live.
+    pub cells: u32,
+    /// Outgoing child edges (task ids this task spawned as children).
+    pub children: Vec<u32>,
+    /// Outgoing dependency edges — task ids whose output/cells this task read (only populated with
+    /// `dependency_tracking: true`). This is the invalidation graph, distinct from `children`.
+    pub deps: Vec<u32>,
+    /// The cells this task owns, each `(value type name, index)`. Global identity is `(id,
+    /// index)`.
+    pub owned_cells: Vec<CellInfo>,
+    /// Cell-granular dependency edges — the specific producer cells this task read (`cell`/`ty`
+    /// are `null` for a whole-output dependency). Only populated with `dependency_tracking:
+    /// true`.
+    pub cell_deps: Vec<CellDepInfo>,
+}
+
+/// A cell owned by a task in the graph export: its value type and index within the owner.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CellInfo {
+    pub ty: &'static str,
+    pub index: u32,
+}
+
+/// A cell-granular dependency edge in the graph export: producer task + the specific cell read.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CellDepInfo {
+    pub task: u32,
+    /// The producer cell's value type (`None` = whole-output dependency).
+    pub ty: Option<&'static str>,
+    /// The producer cell's index (`None` = whole-output dependency).
+    pub cell: Option<u32>,
+}
+
 impl Storage {
     pub fn new(shard_amount: usize, small_preallocation: bool) -> Self {
         let map_capacity: usize = if small_preallocation {
@@ -539,6 +585,59 @@ impl Storage {
     pub fn drop_contents(&self) {
         drop_contents(&self.map);
         drop_contents(&self.snapshots);
+    }
+
+    /// Export the whole resident task graph as a flat list of nodes with their edges + per-task
+    /// metadata, for offline analysis of the graph shape. Includes every resident task (persistent
+    /// and transient) so all edges resolve. Topology comes from **child** edges (always maintained)
+    /// and, when the backend ran with `dependency_tracking: true`, **dependency** edges (the reads
+    /// that drive invalidation). Cells are the data slots inside a task — where the values live.
+    pub fn export_graph_nodes(&self) -> Vec<GraphNodeExport> {
+        let per_shard: Vec<Vec<GraphNodeExport>> =
+            parallel::map_collect(self.map.shards(), |shard| {
+                let shard = shard.read();
+                let mut nodes = Vec::new();
+                for bucket in unsafe { shard.iter() } {
+                    let (task_id, task) = unsafe { bucket.as_ref() };
+                    let t = task.get();
+                    let mut children = Vec::new();
+                    t.for_each_child(|c| children.push(c.to_primitive()));
+                    let mut deps: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+                    t.for_each_dep(|id| {
+                        deps.insert(id.to_primitive());
+                    });
+                    let mut owned_cells = Vec::new();
+                    t.for_each_cell(|c| {
+                        owned_cells.push(CellInfo {
+                            ty: turbo_tasks::registry::get_value_type(c.type_id()).ty.name,
+                            index: c.index(),
+                        });
+                    });
+                    let mut cell_deps = Vec::new();
+                    t.for_each_cell_dep(|task, cell| {
+                        cell_deps.push(CellDepInfo {
+                            task: task.to_primitive(),
+                            ty: cell.map(|c| {
+                                turbo_tasks::registry::get_value_type(c.type_id()).ty.name
+                            }),
+                            cell: cell.map(|c| c.index()),
+                        });
+                    });
+                    nodes.push(GraphNodeExport {
+                        id: task_id.to_primitive(),
+                        ty: t.get_persistent_task_type().map(|ct| ct.get_name()),
+                        transient: task_id.is_transient(),
+                        has_output: t.get_output().is_some(),
+                        cells: t.cell_count(),
+                        children,
+                        deps: deps.into_iter().collect(),
+                        owned_cells,
+                        cell_deps,
+                    });
+                }
+                nodes
+            });
+        per_shard.into_iter().flatten().collect()
     }
 
     /// Drop the `task_cache` map, freeing its memory.

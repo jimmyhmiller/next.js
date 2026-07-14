@@ -537,6 +537,11 @@ pub async fn build(args: &BuildArguments) -> Result<()> {
     let is_ci = std::env::var("CI").is_ok_and(|v| !v.is_empty());
     let is_short_session = true; // build sessions are always short
 
+    // Turn on dependency tracking for a build so the real dependency graph + cell-precise dep edges
+    // are recorded in `TURBO_MEM_GRAPH_EXPORT` (default off — a one-shot build doesn't need
+    // invalidation). Set `TURBO_DEP_TRACKING=1` to enable.
+    let dependency_tracking = std::env::var_os("TURBO_DEP_TRACKING").is_some();
+
     let tt = if args.common.persistent_caching {
         let version_info = GitVersionInfo {
             describe: env!("VERGEN_GIT_DESCRIBE"),
@@ -559,7 +564,7 @@ pub async fn build(args: &BuildArguments) -> Result<()> {
         };
         let tt = TurboTasks::new(TurboTasksBackend::new(
             BackendOptions {
-                dependency_tracking: false,
+                dependency_tracking,
                 storage_mode: Some(storage_mode),
                 ..Default::default()
             },
@@ -578,7 +583,7 @@ pub async fn build(args: &BuildArguments) -> Result<()> {
     } else {
         TurboTasks::new(TurboTasksBackend::new(
             BackendOptions {
-                dependency_tracking: false,
+                dependency_tracking,
                 storage_mode: None,
                 ..Default::default()
             },
@@ -614,6 +619,11 @@ pub async fn build(args: &BuildArguments) -> Result<()> {
     }
 
     builder.build().await?;
+
+    // Export the resident task graph (nodes + child/dependency edges + cells) as JSON for offline
+    // analysis. Gated by `TURBO_MEM_GRAPH_EXPORT=<path>`; pair with `TURBO_DEP_TRACKING=1` for the
+    // dependency edges + cell-precise deps. Runs after the build output is written.
+    tt.backend().maybe_export_graph_json_from_env();
 
     // Intentionally leak this `Arc`. Otherwise we'll waste time during process exit performing a
     // ton of drop calls.

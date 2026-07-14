@@ -541,6 +541,71 @@ pub enum KeyEvictability {
 }
 
 impl TaskStorage {
+    // ===== Graph-export walkers (see `Storage::export_graph_nodes`) =========================
+
+    /// Invoke `f` for each child task id (the spawn/ownership edge). No-op if none resident.
+    pub fn for_each_child(&self, mut f: impl FnMut(TaskId)) {
+        if let Some(children) = self.children() {
+            for &id in children.iter() {
+                f(id);
+            }
+        }
+    }
+
+    /// Invoke `f` for each task id this task *depends on* (output + cell + hashed-cell
+    /// dependencies). Only populated when the backend ran with `dependency_tracking: true`.
+    pub fn for_each_dep(&self, mut f: impl FnMut(TaskId)) {
+        if let Some(d) = self.output_dependencies() {
+            for &id in d.iter() {
+                f(id);
+            }
+        }
+        if let Some(d) = self.cell_dependencies() {
+            for r in d.iter() {
+                f(r.task);
+            }
+        }
+        if let Some(d) = self.cell_dependencies_hashed() {
+            for (r, _) in d.iter() {
+                f(r.task);
+            }
+        }
+    }
+
+    /// Number of resident cells (data slots) this task owns — where its actual values live.
+    pub fn cell_count(&self) -> u32 {
+        self.cell_data().map(|c| c.len() as u32).unwrap_or(0)
+    }
+
+    /// Invoke `f` for each resident cell id this task owns.
+    pub fn for_each_cell(&self, mut f: impl FnMut(CellId)) {
+        if let Some(cd) = self.cell_data() {
+            for (id, _) in cd.iter() {
+                f(*id);
+            }
+        }
+    }
+
+    /// Invoke `f` for each cell-granular dependency: producer task id + the specific producer cell
+    /// (`None` for a whole-output dependency). Only populated with `dependency_tracking: true`.
+    pub fn for_each_cell_dep(&self, mut f: impl FnMut(TaskId, Option<CellId>)) {
+        if let Some(d) = self.output_dependencies() {
+            for &id in d.iter() {
+                f(id, None);
+            }
+        }
+        if let Some(d) = self.cell_dependencies() {
+            for r in d.iter() {
+                f(r.task, Some(r.cell));
+            }
+        }
+        if let Some(d) = self.cell_dependencies_hashed() {
+            for (r, _) in d.iter() {
+                f(r.task, Some(r.cell));
+            }
+        }
+    }
+
     /// Determine the evictability level of this task based on its flags.
     ///
     /// This checks only the flags on the TaskStorage itself. The caller

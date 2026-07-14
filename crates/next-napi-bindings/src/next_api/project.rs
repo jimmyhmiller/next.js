@@ -789,6 +789,23 @@ async fn project_on_exit_internal(project: &ProjectInstance) {
 pub async fn project_shutdown(
     #[napi(ts_arg_type = "{ __napiType: \"Project\" }")] project: External<ProjectInstance>,
 ) {
+    // Dump the resident turbo-tasks task graph (nodes + child/dependency edges + cells) as JSON
+    // when `TURBO_MEM_GRAPH_EXPORT=<path>` is set, for offline analysis. Pair with
+    // `TURBO_DEP_TRACKING=1` (read in `turbopack-build/impl.ts`) to populate the dependency
+    // edges + cell-precise deps. See `turbo-tasks-backend/graph-export/README.md`. Must run
+    // before `stop_and_wait` below, which drops the backend's in-memory storage. Runs on a
+    // blocking thread since it walks the whole graph.
+    if std::env::var_os("TURBO_MEM_GRAPH_EXPORT").is_some() {
+        let turbo_tasks = project.turbopack_ctx.turbo_tasks().clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            turbo_tasks.backend().maybe_export_graph_json_from_env()
+        })
+        .await
+        {
+            eprintln!("TURBO_MEM_GRAPH_EXPORT: export task panicked: {e}");
+        }
+    }
+
     project.turbopack_ctx.turbo_tasks().stop_and_wait().await;
     project_on_exit_internal(&project).await;
 }

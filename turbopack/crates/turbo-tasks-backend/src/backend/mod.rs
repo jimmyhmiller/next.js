@@ -432,6 +432,46 @@ struct TaskExecutionCompletePrepareResult {
 
 // Operations
 impl TurboTasksBackend {
+    /// Export the resident task graph (nodes + child/dependency edges + cells) as JSON to `path`,
+    /// for offline analysis. Returns the number of nodes written. The JSON is a single object
+    /// `{ "task_count", "nodes": [ … ] }`. Run a build with `dependency_tracking: true` to populate
+    /// the dependency edges + cell-precise deps. See `graph-export/README.md`.
+    pub fn export_graph_json(&self, path: &std::path::Path) -> anyhow::Result<usize> {
+        use std::io::Write as _;
+        let nodes = self.storage.export_graph_nodes();
+        let count = nodes.len();
+        let doc = serde_json::json!({ "task_count": count, "nodes": nodes });
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &doc)?;
+        writer.flush()?;
+        Ok(count)
+    }
+
+    /// If the `TURBO_MEM_GRAPH_EXPORT=<path>` env var is set, export the resident task graph to
+    /// that path via [`Self::export_graph_json`] and log the result; a no-op otherwise. Callers
+    /// use this as the single diagnostic entry point after a build (before the backend's
+    /// storage is dropped), so the env var name and log format live in one place. See
+    /// `graph-export/README.md`.
+    pub fn maybe_export_graph_json_from_env(&self) {
+        let Some(path) = std::env::var_os("TURBO_MEM_GRAPH_EXPORT") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        match self.export_graph_json(&path) {
+            Ok(count) => {
+                eprintln!(
+                    "TURBO_MEM_GRAPH_EXPORT: wrote {count} nodes to {}",
+                    path.display()
+                )
+            }
+            Err(e) => eprintln!(
+                "TURBO_MEM_GRAPH_EXPORT: failed to write {}: {e}",
+                path.display()
+            ),
+        }
+    }
+
     fn try_read_task_output(
         &self,
         task_id: TaskId,
