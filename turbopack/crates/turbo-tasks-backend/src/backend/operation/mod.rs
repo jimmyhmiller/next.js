@@ -24,6 +24,7 @@ use turbo_tasks::{
 };
 
 pub use self::aggregation_update::ComputeDirtyAndCleanUpdate;
+pub(crate) use self::connect_child::resurrect_if_deleted;
 use crate::{
     backend::{
         EventDescription, TaskDataCategory, TurboTasksBackend,

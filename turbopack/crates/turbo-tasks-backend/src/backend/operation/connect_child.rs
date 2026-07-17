@@ -21,7 +21,7 @@ use crate::{
 /// to rebuild them — the resurrection is a real re-validation, not just un-flagging. This is the
 /// single chokepoint through which every re-entry (a `task_cache` hit or a disk hit in
 /// `get_or_create_task`) flows, so no `deleted` task can be returned to live use without reviving.
-fn resurrect_if_deleted(task_id: TaskId, ctx: &mut impl ExecuteContext<'_>) {
+pub(crate) fn resurrect_if_deleted(task_id: TaskId, ctx: &mut impl ExecuteContext<'_>) {
     // Cheap Meta-only check first; only escalate on a hit. `deleted` is a Meta-category flag, so a
     // Meta guard suffices to test/clear it — `immutable()` (a Data-category flag) is NOT checked
     // here to avoid forcing a Data restore on the common not-deleted path.

@@ -525,23 +525,31 @@ impl TurboTasksBackend {
         } else {
             None
         };
-        let (mut task, mut reader_task) = if let Some(reader_id) = need_reader_task {
-            // Having a task_pair here is not optimal, but otherwise this would lead to a race
-            // condition. See below.
-            // TODO(sokra): solve that in a more performant way.
-            let (task, reader) = ctx.task_pair(task_id, reader_id, TaskDataCategory::All);
-            (task, Some(reader))
-        } else {
-            (ctx.task(task_id, TaskDataCategory::All), None)
+        let (mut task, mut reader_task) = loop {
+            let pair = if let Some(reader_id) = need_reader_task {
+                // Having a task_pair here is not optimal, but otherwise this would lead to a race
+                // condition. See below.
+                // TODO(sokra): solve that in a more performant way.
+                let (task, reader) = ctx.task_pair(task_id, reader_id, TaskDataCategory::All);
+                (task, Some(reader))
+            } else {
+                (ctx.task(task_id, TaskDataCategory::All), None)
+            };
+            // A GC-soft-deleted task must never be read as-is: it was collected (edges scrubbed)
+            // and the read would return stale contents. Re-entries normally funnel through
+            // `resurrect_if_deleted` at connect, but a read can legitimately arrive first: the
+            // connect's durable `AdjustParentCount` increment may still be queued (the connecting
+            // operation can suspend across a GC pass that collects the task in between). Heal
+            // exactly as connect would — clear the flag, mark dirty so it re-executes — then
+            // retry the read, which now sees a dirty task and waits for its recomputation. We
+            // hold an operation guard here, so a pass cannot re-collect it mid-retry.
+            if pair.0.gc_is_deleted() {
+                drop(pair);
+                operation::resurrect_if_deleted(task_id, &mut ctx);
+                continue;
+            }
+            break pair;
         };
-        // A GC-soft-deleted task must never be read: it was collected (edges scrubbed) and any read
-        // would return stale contents. Every re-entry funnels through `resurrect_if_deleted` at
-        // connect, which clears the flag and re-executes, so reaching here with it still set means
-        // a resurrection path was missed. (debug-only; the flag exists only when GC is enabled.)
-        debug_assert!(
-            !task.gc_is_deleted(),
-            "read_task_output on a GC-deleted task {task_id} — a resurrection path was missed"
-        );
 
         fn listen_to_done_event(
             reader_description: Option<EventDescription>,
@@ -900,11 +908,16 @@ impl TurboTasksBackend {
         } = options;
 
         let mut ctx = self.execute_context(turbo_tasks);
-        let (mut task, reader_task) = if self.should_track_dependencies()
+        let need_reader_task = if self.should_track_dependencies()
             && !matches!(tracking, ReadCellTracking::Untracked)
             && let Some(reader_id) = reader
             && reader_id != task_id
         {
+            Some(reader_id)
+        } else {
+            None
+        };
+        let (mut task, reader_task) = if let Some(reader_id) = need_reader_task {
             // Having a task_pair here is not optimal, but otherwise this would lead to a race
             // condition. See below.
             // TODO(sokra): solve that in a more performant way.
@@ -913,12 +926,22 @@ impl TurboTasksBackend {
         } else {
             (ctx.task(task_id, TaskDataCategory::All), None)
         };
-        // See the matching assert in `try_read_task_output`: a GC-deleted task must be resurrected
-        // (at connect) before any read; reaching a read with the flag still set is a missed path.
-        debug_assert!(
-            !task.gc_is_deleted(),
-            "read_task_cell on a GC-deleted task {task_id} — a resurrection path was missed"
-        );
+        // See the matching healing in `try_read_task_output`: a read can race the connect's
+        // queued count increment across a GC pass, arriving at a soft-deleted task before any
+        // resurrection path has run. Resurrect and re-open.
+        let (mut task, mut reader_task) = if task.gc_is_deleted() {
+            drop(task);
+            drop(reader_task);
+            operation::resurrect_if_deleted(task_id, &mut ctx);
+            if let Some(reader_id) = need_reader_task {
+                let (task, reader) = ctx.task_pair(task_id, reader_id, TaskDataCategory::All);
+                (task, Some(reader))
+            } else {
+                (ctx.task(task_id, TaskDataCategory::All), None)
+            }
+        } else {
+            (task, reader_task)
+        };
 
         let content = if final_read_hint {
             task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence)
@@ -1327,11 +1350,25 @@ impl TurboTasksBackend {
             // hard-deleted this cycle won't be re-tombstoned next snapshot. Only persistent tasks
             // are collected, so a persistent task type (the `TaskCache` key) is always present.
             if inner.gc_is_deleted() {
-                let task_type_hash = compute_task_type_hash(
-                    inner
-                        .get_persistent_task_type()
-                        .expect("a GC-deleted (non-transient) task must have a task type"),
-                );
+                let Some(task_type) = inner.get_persistent_task_type() else {
+                    // A deleted entry with no task type is a zombie: a blank map entry
+                    // manufactured by a stale by-id touch after the real task was collected and
+                    // its disk rows tombstoned (the restore found nothing). There is nothing on
+                    // disk to tombstone; emit a no-op Put and let eviction drop the blank. The
+                    // GC pass refuses to collect such blanks (see the zombie guard in
+                    // `gc_run_job`), so reaching this is a bug in that guard.
+                    debug_assert!(
+                        false,
+                        "snapshot: GC-deleted task {task_id} has no task type (zombie entry)"
+                    );
+                    return SnapshotItem::Put {
+                        task_id,
+                        meta: None,
+                        data: None,
+                        task_type_hash: None,
+                    };
+                };
+                let task_type_hash = compute_task_type_hash(task_type);
                 return SnapshotItem::Delete(TaskDeletion {
                     task_id,
                     task_type_hash,

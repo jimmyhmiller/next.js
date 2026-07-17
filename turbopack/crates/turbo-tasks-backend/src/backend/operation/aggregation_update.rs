@@ -1468,12 +1468,25 @@ impl AggregationUpdateQueue {
                     // children on its context to cascade into; on a normal operation context the
                     // id is recorded on the backend's dead list (incremental GC only) — this is
                     // change propagation identifying garbage the moment it disconnects it.
+                    let mut resurrect: Vec<TaskId> = Vec::new();
                     ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, ctx| {
                         if task.update_and_get_parent_count(delta) == 0 {
                             let id = task.id();
                             ctx.note_gc_parent_count_zeroed(id);
+                        } else if delta > 0 && task.gc_is_deleted() {
+                            // A connect raced GC: `connect_child` checked `resurrect_if_deleted`
+                            // before this durable increment was applied (the operation may have
+                            // suspended across a GC pass), and the pass collected the task in
+                            // between. The edge is real — the parent lists this child — so the
+                            // task must be revived here, or a subsequent read of its (scrubbed)
+                            // output would return stale/empty state. Collect the ids and
+                            // resurrect after the loop (needs fresh task guards).
+                            resurrect.push(task.id());
                         }
                     });
+                    for id in resurrect {
+                        super::connect_child::resurrect_if_deleted(id, ctx);
+                    }
                 }
                 AggregationUpdateJob::AdjustTransientRefCount { task_ids, delta } => {
                     // Session-only sibling of AdjustParentCount for edges from a transient parent.

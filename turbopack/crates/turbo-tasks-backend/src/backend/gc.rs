@@ -333,6 +333,23 @@ impl TurboTasksBackend {
                     }
                     return;
                 }
+                // Zombie guard. The guard was opened with `All`, so if this task exists anywhere
+                // (memory or disk) its persistent task type is present. A typeless entry is a
+                // *zombie*: a blank manufactured by a stale by-id touch (an old reverse-dep scrub,
+                // a resumed suspended operation) after the real task was collected, tombstoned,
+                // and hard-deleted — the restore found no rows and marked an empty storage
+                // restored. It is not collectible garbage, it is residue of garbage that was
+                // ALREADY collected: there is nothing to tear down and nothing on disk to
+                // tombstone (and "collecting" it would panic the snapshot's tombstone writer,
+                // which needs the type hash for the TaskCache bucket). Drop it; eviction removes
+                // the blank entry. Task ids are not recycled, so a stale entry can never alias a
+                // new live task.
+                task.check_access(SpecificTaskDataCategory::Data);
+                if task.typed().get_persistent_task_type().is_none() {
+                    drop(task);
+                    counters.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
 
                 // Capture ALL of this task's edges as `OutdatedEdge`s, then hand them to the same
                 // `CleanupOldEdges` operation a re-executing task uses. This is what makes GC
