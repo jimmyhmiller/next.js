@@ -1462,13 +1462,12 @@ impl AggregationUpdateQueue {
                     // keeping the count crash-consistent.
                     //
                     // A count reaching 0 means the task lost its last persistent parent and may be
-                    // collectible. Outside GC we don't record it (the collectibility is derived
-                    // from the durable `parent_count` directly). During a GC
-                    // pass, the collector runs this decrement (via
-                    // `CleanupOldEdges` on a collected task) and needs to
-                    // discover the newly-parentless children to cascade into:
-                    // `note_gc_parent_count_zeroed` records them on the GC
-                    // context (a no-op for every normal context).
+                    // collectible. `note_gc_parent_count_zeroed` routes that fact to whoever needs
+                    // it: during a GC pass, the collector runs this decrement (via
+                    // `CleanupOldEdges` on a collected task) and collects the newly-parentless
+                    // children on its context to cascade into; on a normal operation context the
+                    // id is recorded on the backend's dead list (incremental GC only) — this is
+                    // change propagation identifying garbage the moment it disconnects it.
                     ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, ctx| {
                         if task.update_and_get_parent_count(delta) == 0 {
                             let id = task.id();
@@ -1478,15 +1477,23 @@ impl AggregationUpdateQueue {
                 }
                 AggregationUpdateJob::AdjustTransientRefCount { task_ids, delta } => {
                     // Session-only sibling of AdjustParentCount for edges from a transient parent.
-                    // Not persisted/replayed, and reaching 0 is not a collection trigger (only
-                    // losing a persistent parent is).
-                    ctx.for_each_task_meta(
-                        task_ids,
-                        "AdjustTransientRefCount",
-                        |mut task, _ctx| {
-                            task.update_and_get_transient_ref_count(delta);
-                        },
-                    );
+                    // Not persisted/replayed.
+                    //
+                    // Reaching 0 IS a garbage-candidate trigger when the persistent parent_count
+                    // is also 0: a persistent task created under a transient root (e.g. the graph
+                    // beneath a `run_once`) is *born* with `parent_count == 0` and kept alive only
+                    // by transient refs, so losing its last transient ref is the only signal it
+                    // ever emits. Without this, the incremental GC's dead list would never learn
+                    // about garbage disconnected from a transient parent (the scan mode finds it
+                    // because it checks both counts on every resident task).
+                    ctx.for_each_task_meta(task_ids, "AdjustTransientRefCount", |mut task, ctx| {
+                        if task.update_and_get_transient_ref_count(delta) == 0
+                            && task.get_parent_count().copied().unwrap_or(0) == 0
+                        {
+                            let id = task.id();
+                            ctx.note_gc_parent_count_zeroed(id);
+                        }
+                    });
                 }
                 AggregationUpdateJob::DecreaseActiveCount { task } => {
                     self.decrease_active_count(ctx, task);

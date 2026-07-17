@@ -914,8 +914,21 @@ impl TaskStorage {
     /// restored. (`is_gc_collectible` reaches here through a restoring `ctx.task(.., All)`
     /// guard, so the gate is trivially satisfied on that path.)
     ///
-    /// The aggregation-edges check is conservative: a disconnected task is typically removed from
-    /// the aggregation graph, but that can lag and race GC, so we back off rather than collect.
+    /// The `upper` check is conservative: a disconnected task is typically removed from the
+    /// aggregation graph, but that can lag and race GC, so we back off rather than collect. It is
+    /// also self-resolving: an upper edge from *garbage* points at an ancestor the cascade
+    /// collects first (whose teardown removes the edge), and an upper edge from a *live*
+    /// aggregating node means the rebalance hasn't caught up yet.
+    ///
+    /// `followers` is deliberately NOT a blocker. A parentless, quiescent, unpinned task's
+    /// follower edges all arise from its own child paths, and the collection teardown
+    /// (`CleanupOldEdges` over all its child edges, driving the aggregation rebalance to
+    /// fixpoint) is precisely what removes them. Blocking on followers deadlocks on garbage that
+    /// contains internal aggregating nodes — e.g. a dependency chain deeper than the aggregation
+    /// leaf threshold: the aggregating link waits for its follower edges (which point at its own
+    /// garbage descendants), while those descendants wait for their parents above — and the
+    /// whole chain below the first aggregating link leaks forever, in scan and incremental mode
+    /// alike. The teardown asserts the followers actually drained (see `gc_mark_deleted`).
     pub fn gc_maybe_collectible(&self) -> bool {
         self.flags.is_restored(TaskDataCategory::Meta)
             // Already collected this session (soft-deleted, awaiting tombstone + hard-delete):
@@ -927,7 +940,52 @@ impl TaskStorage {
             && self.get_activeness().is_none()
             && self.get_in_progress().is_none()
             && self.upper().is_empty()
-            && self.followers().is_none_or(|f| f.is_empty())
+    }
+
+    /// Whether this task has no `followers` aggregation edges. The collection teardown asserts
+    /// this after `CleanupOldEdges` ran (see `gc_maybe_collectible`: followers are drained by the
+    /// teardown itself, so they are not a collectibility blocker — but they must be gone by the
+    /// time the task is marked deleted, or a follower would keep a dangling `upper` edge to a
+    /// tombstoned id).
+    pub fn gc_followers_empty(&self) -> bool {
+        self.followers().is_none_or(|f| f.is_empty())
+    }
+
+    /// Reports why this task fails [`Self::gc_maybe_collectible`] (one reason per failing
+    /// predicate, joined), or `None` if the storage-only checks all pass. Like
+    /// `gc_maybe_collectible` this does NOT cover the transient-*id* check. For tests and GC
+    /// debugging.
+    pub fn gc_uncollectible_reason(&self) -> Option<String> {
+        let mut reasons = Vec::new();
+        if !self.flags.is_restored(TaskDataCategory::Meta) {
+            reasons.push("Meta not restored".to_string());
+        }
+        if self.flags.deleted() {
+            reasons.push("already soft-deleted".to_string());
+        }
+        let parents = self.gc_parent_count();
+        if parents != 0 {
+            reasons.push(format!("parent_count == {parents}"));
+        }
+        let transient = self.gc_transient_ref_count();
+        if transient != 0 {
+            reasons.push(format!("transient_ref_count == {transient}"));
+        }
+        if let Some(activeness) = self.get_activeness() {
+            reasons.push(format!("activeness: {activeness:?}"));
+        }
+        if self.get_in_progress().is_some() {
+            reasons.push("in progress".to_string());
+        }
+        let uppers = self.upper().len();
+        if uppers != 0 {
+            reasons.push(format!("{uppers} upper edge(s)"));
+        }
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join(", "))
+        }
     }
 
     /// Whether this task has been marked soft-deleted by GC (see the `deleted` flag).

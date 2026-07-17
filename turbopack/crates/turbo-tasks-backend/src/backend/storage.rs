@@ -568,6 +568,33 @@ impl Storage {
     /// Parallelized across shards like [`Self::evict_after_snapshot`]: one job per shard scans it
     /// under its own read lock and returns that shard's candidates, which are flattened into a
     /// single list.
+    /// For tests and GC debugging: the `gc_uncollectible_reason` of every resident, non-transient
+    /// task that is NOT collectible, with its id. Tasks with a nonzero `parent_count` are live and
+    /// skipped unless `include_live` — the interesting set is usually "looks like garbage but is
+    /// blocked".
+    pub fn gc_uncollectible_reasons(&self, include_live: bool) -> Vec<(TaskId, String)> {
+        let mut result = Vec::new();
+        for shard in self.map.shards() {
+            let shard = shard.read();
+            // SAFETY: we hold the shard read lock for the duration of iteration.
+            for bucket in unsafe { shard.iter() } {
+                // SAFETY: the read lock guard outlives the bucket reference.
+                let (task_id, shared_value) = unsafe { bucket.as_ref() };
+                if task_id.is_transient() {
+                    continue;
+                }
+                let storage = shared_value.get();
+                if !include_live && storage.gc_parent_count() != 0 {
+                    continue;
+                }
+                if let Some(reason) = storage.gc_uncollectible_reason() {
+                    result.push((*task_id, reason));
+                }
+            }
+        }
+        result
+    }
+
     pub fn gc_collectible_candidates(&self) -> Vec<TaskId> {
         let per_shard: Vec<Vec<TaskId>> = parallel::map_collect(self.map.shards(), |shard| {
             let shard = shard.read();

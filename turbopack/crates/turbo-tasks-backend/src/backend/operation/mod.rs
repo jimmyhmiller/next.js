@@ -92,10 +92,16 @@ pub trait ExecuteContext<'e>: Sized {
     fn operation_suspend_point<T>(&mut self, op: &T)
     where
         T: Clone + Into<AnyOperation>;
-    /// Records that `task_id`'s persistent `parent_count` just reached 0 (it lost its last
-    /// persistent parent). Only the garbage collector's context acts on this — it collects the
-    /// newly-parentless ids so the collecting job can re-check collectibility and cascade a
-    /// `Collect` — so the default is a no-op for all normal operation contexts.
+    /// Records that `task_id` may have just become parentless garbage: its persistent
+    /// `parent_count` reached 0, or its `transient_ref_count` reached 0 while the persistent count
+    /// was already 0. Two consumers act on this:
+    /// - The garbage collector's context collects the ids so the collecting job can re-check
+    ///   collectibility and cascade a `Collect`.
+    /// - Normal operation contexts on a backend running incremental GC record the id on the
+    ///   backend's dead list (see `TurboTasksBackend::gc_record_dead_candidate`) — change
+    ///   propagation identifying garbage as it edits the graph.
+    ///
+    /// The default is a no-op for context implementations without either behavior.
     fn note_gc_parent_count_zeroed(&mut self, task_id: TaskId) {
         let _ = task_id;
     }
@@ -1017,7 +1023,14 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
 
     fn note_gc_parent_count_zeroed(&mut self, task_id: TaskId) {
         if let Some(zeroed) = self.gc_zeroed.as_mut() {
+            // GC context: the collector cascades into these directly (and must not feed its own
+            // dead list — the pass is already handling them).
             zeroed.push(task_id);
+        } else {
+            // Normal operation context: change propagation just dropped this task's last
+            // reference. Record it as a dead-list candidate (a no-op unless the backend runs
+            // incremental GC).
+            self.backend.gc_record_dead_candidate(task_id);
         }
     }
 
@@ -1206,8 +1219,9 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
     }
 
     /// Whether a GC pass may collect this task: it is non-transient, has no persistent or transient
-    /// parents, is quiescent (not active, not in progress), and holds no aggregation edges
-    /// (`upper`/`followers`).
+    /// parents, is quiescent (not active, not in progress), and holds no `upper` aggregation
+    /// edges. (`followers` do not block collection — the teardown itself drains them; see
+    /// [`TaskStorage::gc_maybe_collectible`].)
     ///
     /// The storage-only checks live in [`TaskStorage::gc_maybe_collectible`] so GC's resident-map
     /// scan can reuse them without a guard; this authoritative form adds the transient-*id* check

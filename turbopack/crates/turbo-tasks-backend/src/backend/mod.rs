@@ -57,6 +57,7 @@ use turbo_tasks_malloc::TurboMalloc;
 use self::eviction::EvictionControl;
 pub use self::{
     eviction::EvictionMode,
+    gc::{GcMode, GcPassStats},
     operation::AnyOperation,
     storage::{EvictionCounts, SpecificTaskDataCategory, TaskDataCategory},
 };
@@ -147,6 +148,13 @@ pub struct BackendOptions {
     /// This reclaims memory by clearing persisted data that can be re-loaded from disk on demand.
     /// This is an EXPERIMENTAL FEATURE under development
     pub eviction_mode: EvictionMode,
+
+    /// Enables the garbage-collection pass with the given [`GcMode`], overriding the
+    /// `TURBO_ENGINE_GC` / `TURBO_ENGINE_GC_MODE` environment variables. `None` resolves from the
+    /// environment (GC off unless `TURBO_ENGINE_GC` is set). Used by tests and the
+    /// scan-vs-incremental comparison harness; production wiring goes through the env vars.
+    /// This is an EXPERIMENTAL FEATURE under development
+    pub gc_mode: Option<GcMode>,
 }
 
 impl Default for BackendOptions {
@@ -158,6 +166,7 @@ impl Default for BackendOptions {
             num_workers: None,
             small_preallocation: false,
             eviction_mode: EvictionMode::Off,
+            gc_mode: None,
         }
     }
 }
@@ -214,10 +223,18 @@ pub struct TurboTasksBackend {
     /// `stop_and_wait`).
     snapshot_in_progress: Mutex<()>,
 
-    /// Whether the `parent_count` GC pass runs for this backend. Initialized from the
-    /// `TURBO_ENGINE_GC` static ([`gc::gc_enabled`]) and, in debug builds, forced off if the
-    /// configuration would strand soft-deleted tasks resident — see the constructor.
-    gc_enabled: bool,
+    /// Whether (and how) the `parent_count` GC pass runs for this backend: `None` = GC off.
+    /// Resolved from `BackendOptions::gc_mode`, falling back to the `TURBO_ENGINE_GC` /
+    /// `TURBO_ENGINE_GC_MODE` environment ([`gc::gc_mode_from_env`]); in debug builds, forced off
+    /// if the configuration would strand soft-deleted tasks resident — see the constructor.
+    gc: Option<GcMode>,
+
+    /// The ISMM'08-style dead list: ids recorded at the moment change propagation dropped a task's
+    /// last reference (see [`Self::gc_record_dead_candidate`]). Seeds `GcMode::Incremental` passes
+    /// in O(garbage) instead of scanning the resident map. Empty (never written) unless `gc` is
+    /// `Some(GcMode::Incremental)`. A `FxHashSet` so a task whose count bounces 0 → 1 → 0 between
+    /// passes is recorded once.
+    gc_dead_list: Mutex<FxHashSet<TaskId>>,
 
     stopping: AtomicBool,
     stopping_event: Event,
@@ -260,23 +277,24 @@ impl TurboTasksBackend {
         // `ReadWriteOnShutdown` drain path drops the whole map wholesale (no per-cycle eviction
         // needed), and `ReadOnly` never persists/GCs. In debug builds, refuse the unsafe combo by
         // forcing GC off with a warning; release builds trust the caller's configuration.
-        let mut gc_enabled = gc::gc_enabled();
+        let mut gc = options.gc_mode.or_else(gc::gc_mode_from_env);
         #[cfg(debug_assertions)]
-        if gc_enabled
+        if gc.is_some()
             && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
             && options.eviction_mode == EvictionMode::Off
         {
             eprintln!(
-                "warning: TURBO_ENGINE_GC is set but eviction is disabled on a ReadWrite backend; \
-                 GC would leave collected tasks resident forever. Forcing GC off. Enable eviction \
+                "warning: GC is enabled but eviction is disabled on a ReadWrite backend; GC would \
+                 leave collected tasks resident forever. Forcing GC off. Enable eviction \
                  (EvictionMode::Auto/Full) to use GC in this mode."
             );
-            gc_enabled = false;
+            gc = None;
         }
 
         Self {
             options,
-            gc_enabled,
+            gc,
+            gc_dead_list: Mutex::new(FxHashSet::default()),
             start_time: Instant::now(),
             persisted_task_id_factory: IdFactoryWithReuse::new(
                 next_task_id,
@@ -1037,19 +1055,34 @@ impl TurboTasksBackend {
         // commit: in the production (GC-enabled) path they are produced right here under the *same
         // continuous exclusion* as the snapshot (the atomic `into_snapshot` hand-off), so nothing
         // could have resurrected a collected task.
-        let mut snapshot_phase = if self.gc_enabled {
-            // `collected` is recorded on the span (below) once the pass finishes. `begin_gc` blocks
-            // until in-flight operations drain (spanned inside the coordinator); `into_snapshot`
-            // then hands exclusion straight to the snapshot phase without releasing it (no further
-            // drain — no operation can have started). The pass marks collected tasks soft-deleted
-            // (and modified) rather than removing them; the snapshot below derives their on-disk
-            // tombstones from the `deleted` flag and commits them in the same batch as the puts.
-            let gc_span =
-                tracing::info_span!(parent: parent_span.clone(), "gc", collected = tracing::field::Empty)
-                    .entered();
+        let mut snapshot_phase = if let Some(gc_mode) = self.gc {
+            // The pass stats are recorded on the span (below) once the pass finishes. `begin_gc`
+            // blocks until in-flight operations drain (spanned inside the coordinator);
+            // `into_snapshot` then hands exclusion straight to the snapshot phase without releasing
+            // it (no further drain — no operation can have started). The pass marks collected tasks
+            // soft-deleted (and modified) rather than removing them; the snapshot below derives
+            // their on-disk tombstones from the `deleted` flag and commits them in the same batch
+            // as the puts.
+            let gc_span = tracing::info_span!(
+                parent: parent_span.clone(),
+                "gc",
+                mode = ?gc_mode,
+                collected = tracing::field::Empty,
+                seed_candidates = tracing::field::Empty,
+                requeued = tracing::field::Empty,
+                dropped_stale = tracing::field::Empty,
+                seed_us = tracing::field::Empty,
+                total_us = tracing::field::Empty,
+            )
+            .entered();
             let gc_phase = self.snapshot_coord.begin_gc();
-            let collected = self.gc_collect(turbo_tasks);
-            gc_span.record("collected", collected);
+            let stats = self.gc_collect(gc_mode, turbo_tasks);
+            gc_span.record("collected", stats.collected);
+            gc_span.record("seed_candidates", stats.seed_candidates);
+            gc_span.record("requeued", stats.requeued);
+            gc_span.record("dropped_stale", stats.dropped_stale);
+            gc_span.record("seed_us", stats.seed_duration.as_micros() as u64);
+            gc_span.record("total_us", stats.total_duration.as_micros() as u64);
             gc_phase.into_snapshot()
         } else {
             // `begin_snapshot` blocks until in-flight operations drain (spanned inside the

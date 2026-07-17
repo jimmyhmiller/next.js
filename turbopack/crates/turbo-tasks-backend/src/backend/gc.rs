@@ -7,15 +7,29 @@
 //! operations — and is driven as a fully parallel, self-feeding job pool
 //! (see [`TurboTasksBackend::gc_collect`]).
 //!
+//! A pass is seeded in one of two ways ([`GcMode`]): by scanning the resident map for
+//! `parent_count == 0` tasks (`Scan`), or from the **dead list** (`Incremental`) — a set of
+//! candidate ids recorded at the exact moment change propagation dropped a task's last reference,
+//! following Hammer & Acar, "Memory Management for Self-Adjusting Computation" (ISMM'08). In the
+//! incremental mode the invalidation/re-execution machinery itself identifies garbage (re-executing
+//! a task removes the edges it did not re-establish; the removal that drops a child's last
+//! reference records it), so a pass costs O(garbage), not O(resident tasks). Dead-list entries are
+//! *hints*, not verdicts: they are recorded outside the GC phase, so a candidate may have been
+//! resurrected (a task-cache hit reconnected it — the paper's "reuse") before the pass runs; every
+//! entry is re-validated under the GC phase before teardown.
+//!
 //! This module holds the GC-specific logic (the job types, the pool driver, per-job teardown, and
 //! the pin/unpin bookkeeping) as an `impl TurboTasksBackend`; it is a child of the `backend` module
 //! so it reaches the backend's private state (`storage`, `snapshot_coord`) and the GC-only
 //! `execute_context_gc` directly. Callers (`snapshot_and_persist`, `stop`, the background job loop,
 //! the `Backend` trait's `pin_task_for_gc`/`unpin_task_for_gc`) live in `mod.rs`.
 
-use std::sync::{
-    LazyLock,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use turbo_tasks::{
@@ -33,19 +47,100 @@ use crate::backend::{
     storage_schema::TaskStorageAccessors,
 };
 
-/// When `TURBO_ENGINE_GC` is set to a truthy value, the background job runs a `parent_count`-driven
-/// garbage-collection pass (tearing down tasks whose persistent parent count reached 0). Opt-in
-/// until it has been proven on trusted apps; the eventual default-on flip gets its own escape
-/// hatch.
-static GC_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var_os("TURBO_ENGINE_GC")
-        .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")))
+/// How a GC pass finds its collection candidates.
+///
+/// Both modes share the same teardown (re-validate under the GC phase, `CleanupOldEdges`,
+/// soft-delete + tombstone, cascade); they differ only in how the pass is *seeded*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GcMode {
+    /// Seed each pass by scanning the entire resident task map for tasks that pass the
+    /// `gc_maybe_collectible` pre-filter. Cost is O(resident tasks) per pass, regardless of how
+    /// much garbage there is.
+    Scan,
+    /// Seed each pass from the dead list: candidates recorded at the exact moment change
+    /// propagation dropped a task's last reference (see
+    /// [`TurboTasksBackend::gc_record_dead_candidate`]). Cost is O(garbage) per pass — the pass
+    /// never looks at live tasks. This is the trace-driven discipline of Hammer & Acar,
+    /// "Memory Management for Self-Adjusting Computation" (ISMM'08): change propagation itself
+    /// identifies garbage, so no traversal or scan of the live set is needed.
+    Incremental,
+}
+
+/// GC configuration from the environment: `None` when `TURBO_ENGINE_GC` is unset/falsy, otherwise
+/// the mode selected by `TURBO_ENGINE_GC_MODE` (`scan` or `incremental`; default `incremental`).
+/// Opt-in until it has been proven on trusted apps; the eventual default-on flip gets its own
+/// escape hatch.
+static GC_MODE_FROM_ENV: LazyLock<Option<GcMode>> = LazyLock::new(|| {
+    let enabled = std::env::var_os("TURBO_ENGINE_GC")
+        .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
+    if !enabled {
+        return None;
+    }
+    match std::env::var_os("TURBO_ENGINE_GC_MODE") {
+        None => Some(GcMode::Incremental),
+        Some(v) => match v.to_str() {
+            Some("incremental") => Some(GcMode::Incremental),
+            Some("scan") => Some(GcMode::Scan),
+            other => panic!(
+                "invalid TURBO_ENGINE_GC_MODE value {other:?}: expected \"scan\" or \
+                 \"incremental\""
+            ),
+        },
+    }
 });
 
-/// Whether the `parent_count`-driven GC pass is enabled (via `TURBO_ENGINE_GC`). Read by
-/// `snapshot_and_persist` to decide whether to run GC before the snapshot.
-pub(super) fn gc_enabled() -> bool {
-    *GC_ENABLED
+/// The GC configuration resolved from `TURBO_ENGINE_GC` / `TURBO_ENGINE_GC_MODE`. Used by the
+/// backend constructor when `BackendOptions::gc_mode` does not override it.
+pub(super) fn gc_mode_from_env() -> Option<GcMode> {
+    *GC_MODE_FROM_ENV
+}
+
+/// Counters and timings from one GC pass. Logged on the `gc` tracing span by
+/// `snapshot_and_persist`, and returned by `gc_stats_for_testing` for the scan-vs-incremental
+/// comparison harness.
+#[derive(Debug, Clone, Copy)]
+pub struct GcPassStats {
+    /// How this pass was seeded.
+    pub mode: GcMode,
+    /// Number of candidates the pass was seeded with (scan pre-filter hits, or drained dead-list
+    /// entries).
+    pub seed_candidates: usize,
+    /// Tasks collected (marked soft-deleted) by this pass, including cascade discoveries.
+    pub collected: usize,
+    /// Candidates that are still parentless but currently blocked from collection (pinned, active,
+    /// in progress, or holding `upper` aggregation edges); put back on the dead list for a later
+    /// pass. Always 0 in scan mode (the next scan re-discovers them).
+    pub requeued: usize,
+    /// Stale candidates dropped: resurrected since being recorded (gained a parent) or already
+    /// collected. Always 0 in scan mode (the scan runs under the GC phase, so it cannot be stale).
+    pub dropped_stale: usize,
+    /// Time spent seeding the pass (the map scan, or the dead-list drain).
+    pub seed_duration: Duration,
+    /// Total pass time, including seeding. Excludes the operation-drain wait in `begin_gc`.
+    pub total_duration: Duration,
+}
+
+impl GcPassStats {
+    fn empty(mode: GcMode, seed_duration: Duration, total_duration: Duration) -> Self {
+        Self {
+            mode,
+            seed_candidates: 0,
+            collected: 0,
+            requeued: 0,
+            dropped_stale: 0,
+            seed_duration,
+            total_duration,
+        }
+    }
+}
+
+/// Shared accumulators for one pass's jobs. Each field is written on a rare per-task outcome (not
+/// per child/dep), so the atomics are not a hot path.
+#[derive(Default)]
+struct GcCounters {
+    collected: AtomicUsize,
+    requeued: AtomicUsize,
+    dropped_stale: AtomicUsize,
 }
 
 /// A unit of garbage-collection work fed through the self-feeding parallel pool in
@@ -77,8 +172,9 @@ impl TurboTasksBackend {
         ExecuteContextImpl::new_for_gc(self, turbo_tasks)
     }
 
-    /// Runs a garbage-collection pass under the coordinator's GC phase. Scans the resident map for
-    /// collectible tasks (no persistent parent, quiescent, no aggregation edges), re-validates each
+    /// Runs a garbage-collection pass under the coordinator's GC phase. Seeds candidates according
+    /// to `mode` — scanning the resident map for collectible tasks (no persistent parent,
+    /// quiescent, no `upper` aggregation edges), or draining the dead list — re-validates each
     /// under the exclusion, and tears down the ones that are still collectible: scrubbing their
     /// reverse-dependency edges, decrementing their children's `parent_count` (cascading to any
     /// child that reaches 0), removing them from the in-memory map + task_cache, and buffering an
@@ -117,19 +213,16 @@ impl TurboTasksBackend {
     /// on free worker threads (robust on thread-limited runtimes). GC runs from a synchronous
     /// backend context (like `connect_children`, which also fans out onto the scope machinery).
     ///
-    /// Returns the number of tasks collected (marked soft-deleted). The on-disk tombstones are not
-    /// produced here — collected tasks are left resident with their `deleted` flag set, and the
-    /// next snapshot derives the tombstones from that flag (see `snapshot_and_persist`).
-    pub(crate) fn gc_collect(&self, turbo_tasks: &TurboTasks<TurboTasksBackend>) -> usize {
-        // Seed the pool by scanning the resident map for tasks that pass the cheap
-        // `gc_maybe_collectible` pre-filter (a handful of field reads per task under a shard read
-        // lock — the same shape as the eviction scan, which proved this is fast). We scan rather
-        // than maintain an incremental candidate set: correctness derives entirely from each task's
-        // durable `parent_count`, so there's nothing to persist across sessions and nothing to keep
-        // in sync (a scan can't miss a task the way a hand-maintained side-set could). `Collect`
-        // re-validates each candidate authoritatively under a guard. The scan only sees resident
-        // tasks; disk-only garbage is collected after it is next restored.
-        //
+    /// Returns the pass's [`GcPassStats`] (`collected` counts tasks marked soft-deleted). The
+    /// on-disk tombstones are not produced here — collected tasks are left resident with their
+    /// `deleted` flag set, and the next snapshot derives the tombstones from that flag (see
+    /// `snapshot_and_persist`).
+    pub(crate) fn gc_collect(
+        &self,
+        mode: GcMode,
+        turbo_tasks: &TurboTasks<TurboTasksBackend>,
+    ) -> GcPassStats {
+        let pass_start = Instant::now();
         // TODO(perf): recycle the task ids of collected tasks. `persisted_task_id_factory`
         // (`IdFactoryWithReuse`) can hand out freed ids, and the persisted `next_free_task_id`
         // high-water mark only grows today, so the id space grows unboundedly across churn even
@@ -139,24 +232,55 @@ impl TurboTasksBackend {
         // commit a `get_or_create_task` for the same type could re-mint the id, and the id must not
         // be handed out while any live `OperationVc`/`DetachedVc` still references it. Feed the
         // recycled ids into `persisted_task_id_factory` so the high-water mark can stop growing.
-        let seeds: Vec<GcJob> = self
-            .storage
-            .gc_collectible_candidates()
-            .into_iter()
-            .map(GcJob::Collect)
-            .collect();
+        let seeds: Vec<GcJob> = match mode {
+            // Seed the pool by scanning the resident map for tasks that pass the cheap
+            // `gc_maybe_collectible` pre-filter (a handful of field reads per task under a shard
+            // read lock — the same shape as the eviction scan, which proved this is fast).
+            // Correctness derives entirely from each task's durable `parent_count`, so a scan
+            // can't miss resident garbage; the cost is O(resident tasks) per pass. The scan only
+            // sees resident tasks; disk-only garbage is collected after it is next restored.
+            GcMode::Scan => self
+                .storage
+                .gc_collectible_candidates()
+                .into_iter()
+                .map(GcJob::Collect)
+                .collect(),
+            // Seed the pool from the dead list: every candidate was recorded at the moment change
+            // propagation dropped its last reference, so the seed cost is O(garbage). The entries
+            // were recorded *outside* the GC phase and may be stale (resurrected since); `Collect`
+            // re-validates each under its guard and drops or requeues the ones that no longer
+            // qualify. Draining (rather than copying) the set is what keeps each pass incremental:
+            // whatever survives re-validation is either collected now or explicitly requeued.
+            //
+            // A dead-list entry need not be resident: garbage can be evicted to disk between being
+            // recorded and the pass (the entry survives eviction, unlike a scan hit). `Collect`
+            // restores it from disk to tear it down, and its tombstone rides the next snapshot.
+            GcMode::Incremental => {
+                let mut dead_list = self.gc_dead_list.lock();
+                dead_list.drain().map(GcJob::Collect).collect()
+            }
+        };
+        let seed_duration = pass_start.elapsed();
         if seeds.is_empty() {
-            return 0;
+            return GcPassStats::empty(mode, seed_duration, pass_start.elapsed());
         }
+        let seed_candidates = seeds.len();
 
-        // Written once per collected task (not per child/dep), so the atomic is not a hot path.
-        let collected = AtomicUsize::new(0);
+        let counters = GcCounters::default();
 
         scope_self_feeding(seeds, |spawner, job| {
-            self.gc_run_job(job, spawner, turbo_tasks, &collected);
+            self.gc_run_job(job, mode, spawner, turbo_tasks, &counters);
         });
 
-        collected.into_inner()
+        GcPassStats {
+            mode,
+            seed_candidates,
+            collected: counters.collected.load(Ordering::Relaxed),
+            requeued: counters.requeued.load(Ordering::Relaxed),
+            dropped_stale: counters.dropped_stale.load(Ordering::Relaxed),
+            seed_duration,
+            total_duration: pass_start.elapsed(),
+        }
     }
 
     /// Runs one [`GcJob`], possibly spawning follow-up jobs into the same pool. See
@@ -165,9 +289,10 @@ impl TurboTasksBackend {
     fn gc_run_job(
         &self,
         job: GcJob,
+        mode: GcMode,
         spawner: &Spawner<'_, '_, GcJob>,
         turbo_tasks: &TurboTasks<TurboTasksBackend>,
-        collected: &AtomicUsize,
+        counters: &GcCounters,
     ) {
         match job {
             GcJob::Collect(task_id) => {
@@ -175,12 +300,39 @@ impl TurboTasksBackend {
                 // `All` restores Data so the edge capture below can read the Data-category dep
                 // sets.
                 let task = ctx.task(task_id, TaskDataCategory::All);
-                debug_assert!(
-                    task.is_gc_collectible(),
-                    "gc: Collect({task_id}) for a non-collectible task — the seed scan's \
-                     Meta-resident `gc_maybe_collectible` filter and the cascade's collectibility \
-                     check should guarantee collectibility under the GC phase"
-                );
+                if !task.is_gc_collectible() {
+                    // Scan seeds and cascade spawns are validated under the GC phase, so they can
+                    // never arrive here stale; only a dead-list seed can (it was recorded during
+                    // normal operation, and the world moved on before this pass).
+                    debug_assert!(
+                        mode == GcMode::Incremental,
+                        "gc: Collect({task_id}) for a non-collectible task in scan mode — the \
+                         seed scan's Meta-resident `gc_maybe_collectible` filter and the \
+                         cascade's collectibility check should guarantee collectibility under the \
+                         GC phase"
+                    );
+                    // A candidate that is still parentless is real garbage that is merely
+                    // *blocked* right now (pinned via `transient_ref_count`, active, in progress,
+                    // or still holding `upper` aggregation edges the rebalance hasn't dropped yet).
+                    // None of those conditions re-fire the dead-list hook when
+                    // they clear — only reference-count transitions do — so put
+                    // it back on the dead list for a later pass. A candidate
+                    // that gained a parent was resurrected (the paper's
+                    // "reuse": a task-cache hit reconnected it): drop it; if it ever loses that
+                    // parent again the count transition re-records it.
+                    task.check_access(SpecificTaskDataCategory::Meta);
+                    let still_parentless = !task_id.is_transient()
+                        && !task.gc_is_deleted()
+                        && task.get_parent_count().copied().unwrap_or(0) == 0;
+                    drop(task);
+                    if still_parentless {
+                        self.gc_dead_list.lock().insert(task_id);
+                        counters.requeued.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        counters.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
 
                 // Capture ALL of this task's edges as `OutdatedEdge`s, then hand them to the same
                 // `CleanupOldEdges` operation a re-executing task uses. This is what makes GC
@@ -224,14 +376,14 @@ impl TurboTasksBackend {
                 // it soft-deleted and keep it resident. The next snapshot tombstones its on-disk
                 // copy; a later step hard-deletes it from memory once the tombstone has committed.
                 self.gc_mark_deleted(task_id, &mut ctx);
-                collected.fetch_add(1, Ordering::Relaxed);
+                counters.collected.fetch_add(1, Ordering::Relaxed);
 
                 // `CleanupOldEdges` recorded (on this GC context) every child whose persistent
                 // `parent_count` reached 0. Those are the cascade candidates: re-check
                 // collectibility under each child's guard (count 0 alone isn't enough — it could be
-                // pinned, a root, or still hold aggregation edges) and spawn a `Collect` for the
-                // ones that are collectible. Each child reaches 0 exactly once, so there is no
-                // double-queueing.
+                // pinned, a root, or still hold `upper` aggregation edges) and spawn a `Collect`
+                // for the ones that are collectible. Each child reaches 0 exactly
+                // once, so there is no double-queueing.
                 let newly_parentless = ctx.take_gc_parent_count_zeroed();
                 for child in newly_parentless {
                     debug_assert!(
@@ -240,6 +392,13 @@ impl TurboTasksBackend {
                     );
                     if ctx.task(child, TaskDataCategory::Meta).is_gc_collectible() {
                         spawner.spawn(GcJob::Collect(child));
+                    } else if mode == GcMode::Incremental {
+                        // Parentless but blocked (pinned, active, or the aggregation rebalance
+                        // for a *different* upper is still pending). In scan mode the next scan
+                        // re-discovers it; the dead list must remember it explicitly, because its
+                        // reference counts already transitioned — the hook will not fire again.
+                        self.gc_dead_list.lock().insert(child);
+                        counters.requeued.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -261,6 +420,14 @@ impl TurboTasksBackend {
     /// called while holding the GC phase.
     fn gc_mark_deleted(&self, task_id: TaskId, ctx: &mut impl ExecuteContext<'_>) {
         let mut task = ctx.task(task_id, TaskDataCategory::Meta);
+        // Followers are not a collectibility blocker (see `gc_maybe_collectible`), because the
+        // `CleanupOldEdges` teardown that just ran removes the child edges they arise from and
+        // drives the rebalance to fixpoint. Verify that actually drained them: a leftover
+        // follower would keep a dangling `upper` edge to this soon-tombstoned id.
+        debug_assert!(
+            task.typed().gc_followers_empty(),
+            "gc: task {task_id} still has follower edges after its teardown"
+        );
         task.gc_set_deleted();
         // Force the task into the next snapshot's per-shard modified scan so `process` can
         // tombstone it. A cleanly-disconnected collectible task typically has no modified
@@ -327,15 +494,81 @@ impl TurboTasksBackend {
         );
     }
 
+    /// Records `task_id` as a garbage candidate on the dead list. Called (via
+    /// [`ExecuteContext::note_gc_parent_count_zeroed`] on normal operation contexts) at the moment
+    /// change propagation drops a task's last reference — its persistent `parent_count` reaches 0,
+    /// or its `transient_ref_count` reaches 0 while the persistent count is already 0. This is the
+    /// ISMM'08 "dead list": change propagation itself identifies garbage as it edits the graph, so
+    /// an incremental GC pass is seeded in O(garbage) with no scan of the live set.
+    ///
+    /// The entry is a *hint*: the task may be resurrected (reconnected) before the next pass, so
+    /// the pass re-validates every entry under the GC phase. Recording is a no-op unless this
+    /// backend runs incremental GC — without a draining pass the set would only grow.
+    ///
+    /// Insertion into the mutex-guarded set is cheap and rare: it happens only on a
+    /// last-reference-dropped transition, not per edge update.
+    pub(crate) fn gc_record_dead_candidate(&self, task_id: TaskId) {
+        if self.gc != Some(GcMode::Incremental) {
+            return;
+        }
+        if task_id.is_transient() {
+            // Transient tasks are never collected; recording one would requeue it forever.
+            debug_assert!(
+                false,
+                "gc: a transient task ({task_id}) should never be recorded as a dead-list \
+                 candidate"
+            );
+            return;
+        }
+        self.gc_dead_list.lock().insert(task_id);
+    }
+
     /// Runs a full GC pass under the GC phase and returns the number of tasks collected (marked
     /// soft-deleted). The tombstones are derived by a subsequent snapshot from the `deleted` flag,
     /// so — unlike before — nothing needs to be threaded to `snapshot_and_evict_for_testing`
     /// (production runs GC inline in `snapshot_and_persist`). Test-only hook; callers must be idle
     /// (no task executing).
+    ///
+    /// Uses the backend's configured GC mode, falling back to a scan when GC is not configured
+    /// (the historical behavior of this hook; a scan needs no prior candidate tracking).
     #[doc(hidden)]
     pub fn gc_for_testing(&self, turbo_tasks: &TurboTasks<TurboTasksBackend>) -> usize {
+        self.gc_stats_for_testing(turbo_tasks, self.gc.unwrap_or(GcMode::Scan))
+            .collected
+    }
+
+    /// Reports why `task_id` is currently not collectible (one reason string per failing
+    /// predicate), or `None` if it is collectible. For tests and GC debugging; mirrors
+    /// `TaskStorage::gc_maybe_collectible`.
+    #[doc(hidden)]
+    pub fn gc_uncollectible_reason_for_testing(&self, task_id: TaskId) -> Option<String> {
+        if task_id.is_transient() {
+            return Some("transient id".to_string());
+        }
+        self.storage
+            .with_task(task_id, |t| t.gc_uncollectible_reason())
+            .unwrap_or_else(|| Some("not resident".to_string()))
+    }
+
+    /// For tests and GC debugging: `(task, reason)` for every resident, non-transient,
+    /// parentless-but-blocked task (see `Storage::gc_uncollectible_reasons`).
+    #[doc(hidden)]
+    pub fn gc_blocked_tasks_for_testing(&self) -> Vec<(TaskId, String)> {
+        self.storage.gc_uncollectible_reasons(false)
+    }
+
+    /// Like [`Self::gc_for_testing`], but runs the pass in an explicit mode and returns the full
+    /// [`GcPassStats`]. Used by the scan-vs-incremental comparison harness. Note that an
+    /// `Incremental` pass only sees candidates recorded while the backend was configured with
+    /// `BackendOptions::gc_mode == Some(GcMode::Incremental)` (recording is off otherwise).
+    #[doc(hidden)]
+    pub fn gc_stats_for_testing(
+        &self,
+        turbo_tasks: &TurboTasks<TurboTasksBackend>,
+        mode: GcMode,
+    ) -> GcPassStats {
         let _serialize = self.snapshot_in_progress.lock();
         let _gc_phase = self.snapshot_coord.begin_gc();
-        self.gc_collect(turbo_tasks)
+        self.gc_collect(mode, turbo_tasks)
     }
 }
